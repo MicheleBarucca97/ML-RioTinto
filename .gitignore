@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+ml-env/
+venv/
+env/
+
+# Data and models (too large for git)
+data/
+models/
+*.pth
+*.h5
+*.ckpt
+*.weights
+
+# Results/logs
+results_log.txt
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+to_read/
