@@ -8,7 +8,7 @@ import yaml  # <--- Added this
 
 # Imports from our files
 from dataset import GaussianDataset
-from model import FFNN
+from model import FFNN, ResFFNN
 
 
 def main():
@@ -43,8 +43,8 @@ def main():
     n_gaussians = cfg["data"]["n_gaussians"]
     m_points = cfg["data"]["M"]
 
-    model = FFNN(in_dim=n_gaussians * 3, out_dim=m_points,
-                 hidden_dims=[512, 512, 512]).to(device)
+    model = ResFFNN(in_dim=n_gaussians * 3, out_dim=m_points,
+                    hidden_dim=256, num_blocks=3).to(device)
 
     # 4. Setup Optimizer and Loss
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)

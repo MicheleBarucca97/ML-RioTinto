@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 # Import your classes
 from dataset import GaussianDataset
-from model import FFNN
+from model import FFNN, ResFFNN
 
 
 def evaluate(config_path, model_path, n_plots=5):
@@ -31,8 +31,8 @@ def evaluate(config_path, model_path, n_plots=5):
     in_dim = cfg["data"]["n_gaussians"] * 3
     out_dim = cfg["data"]["M"]
 
-    model = FFNN(in_dim=in_dim, out_dim=out_dim,
-                 hidden_dims=[512, 512, 512]).to(device)
+    model = ResFFNN(in_dim=in_dim, out_dim=out_dim,
+                    hidden_dim=256, num_blocks=3).to(device)
 
     # 4. Load Weights
     # In classical PyTorch, we load the "state_dict"
