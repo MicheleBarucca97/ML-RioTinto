@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 # Import your classes
 from dataset import GaussianDataset
-from model import FFNN, ResFFNN
+from model import DeepONet, ResFFNN, FFNN
 
 
 def evaluate(config_path, model_path, n_plots=5):
@@ -27,12 +27,31 @@ def evaluate(config_path, model_path, n_plots=5):
                              num_workers=2)
 
     # 3. Initialize Model
-    # Must match the architecture in train.py exactly
-    in_dim = cfg["data"]["n_gaussians"] * 3
-    out_dim = cfg["data"]["M"]
+    model_cfg = cfg["model"]
+    model_type = model_cfg["type"]
+    n_params = cfg["data"]["n_gaussians"] * 3
+    m_points = cfg["data"]["M"]
 
-    model = ResFFNN(in_dim=in_dim, out_dim=out_dim,
-                    hidden_dim=256, num_blocks=3).to(device)
+    if model_type == "FFNN":
+        model = FFNN(in_dim=n_params, out_dim=m_points, 
+                    hidden_dims=[model_cfg["hidden_dim"]]*3)
+    elif model_type == "ResFFNN":
+        model = ResFFNN(in_dim=n_params, out_dim=m_points, 
+                        hidden_dim=model_cfg["hidden_dim"], 
+                        num_blocks=model_cfg["num_blocks"])
+    elif model_type == "DeepONet":
+        model = DeepONet(n_params=n_params, 
+                        hidden_dim=model_cfg["hidden_dim"], 
+                        latent_dim=model_cfg["latent_dim"])
+        # Pre-create the spatial grid based on config
+        # Shape: [M, 1]
+        x_grid = torch.linspace(cfg["data"]["x_min"],
+                                cfg["data"]["x_max"],
+                                cfg["data"]["M"]).to(device).unsqueeze(-1)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+    model = model.to(device)
 
     # 4. Load Weights
     # In classical PyTorch, we load the "state_dict"
@@ -57,7 +76,10 @@ def evaluate(config_path, model_path, n_plots=5):
             u = u.to(device)  # This is the normalized target
 
             # Predict
-            preds_norm = model(p)
+            if model_type == "DeepONet":
+                preds_norm = model(p, x_grid)
+            else:
+                preds_norm = model(p)
 
             # Denormalize: Real = Norm * Std + Mean
             preds_real = preds_norm * u_std + u_mean
@@ -74,11 +96,15 @@ def evaluate(config_path, model_path, n_plots=5):
     # Calculate RMSE
     mse = np.mean((preds - targets) ** 2, axis=1)
     rmse = np.sqrt(mse)
+    diff_norm = np.linalg.norm(preds - targets, axis=1)
+    target_norm = np.linalg.norm(targets, axis=1)
+    rel_l2 = diff_norm / target_norm
 
     print("=" * 40)
     print(f"Results on {len(preds)} test samples:")
     print(f"Mean RMSE: {rmse.mean():.6f}")
     print(f"Std RMSE:  {rmse.std():.6f}")
+    print(f"Mean Rel L2 Error: {rel_l2.mean():.6f}")
     print("=" * 40)
 
     # 7. Plotting
