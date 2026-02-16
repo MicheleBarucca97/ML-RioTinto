@@ -27,6 +27,13 @@ class GaussianDataset(Dataset):
 
         # Normalize
         p = (p_raw - self.p_mean) / self.p_std
-        u = (u_raw - self.u_mean) / self.u_std
+        '''
+        If the target u is normalized to have mean 0 and std 1, but 
+        the physical peaks are all positive and very sharp, the "mean" 
+        of the entire grid is a very small number, but the "std" is 
+        large because of the peaks. This creates a target that is 
+        mostly "noise" to the model.
+        '''
+        u = u_raw
 
         return p, u

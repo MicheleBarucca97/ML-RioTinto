@@ -10,22 +10,30 @@ import yaml
 
 # Imports from our files
 from dataset import GaussianDataset
-from model import DeepONet, ResFFNN, FFNN
+from model import DeepONet, ResFFNN, FFNN, CorrectionNet
 from utils import set_seed
 
-# --- Define the Relative L2 Loss function ---
-class RelL2Loss(nn.Module):
-    def forward(self, pred, target):
-        # Calculate L2 norm across the spatial dimension (dim=1)
-        num = torch.norm(pred - target, p=2, dim=1)
-        den = torch.norm(target, p=2, dim=1)
-        # We use mean of the ratio for the batch loss
-        return torch.mean(num / (den + 1e-7))
+def analytic_gaussians(params, x, p_mean, p_std):
+    # params is normalized from the DataLoader. 
+    # Denormalize to get real A, c, and log10_s
+    params = params * p_std.to(params.device) + p_mean.to(params.device)
+    
+    # params: [B, 30], x: [M,1]
+    B, _ = params.shape
+    params = params.view(B, -1, 3)  # [B,10,3]
 
-def weighted_mse_loss(pred, target):
-    # Weight the loss: points where target > 0.1 get 10x more importance
-    weights = torch.where(target > 0.1, 10.0, 1.0)
-    return torch.mean(weights * (pred - target) ** 2)
+    A = params[..., 0].unsqueeze(-1)
+    c = params[..., 1].unsqueeze(-1)
+    s = (10**params[..., 2] + 1e-9).unsqueeze(-1)
+
+    # x: [M, 1] -> [1, 1, M]
+    x_reshaped = x.view(1, 1, -1)
+
+    return torch.sum(
+        A * torch.exp(-0.5 * ((x_reshaped - c) / s) ** 2),
+        dim=1
+    )  # [B,M]
+
 
 def main():
     # 1. Load Configuration
@@ -75,6 +83,12 @@ def main():
     n_params = cfg["data"]["n_gaussians"] * 3
     m_points = cfg["data"]["M"]
 
+    # Pre-create the spatial grid based on config
+    # Shape: [M, 1]
+    x_grid = torch.linspace(cfg["data"]["x_min"],
+                                cfg["data"]["x_max"],
+                                cfg["data"]["M"], dtype=torch.float32).to(device).unsqueeze(-1)
+
     if model_type == "FFNN":
         model = FFNN(in_dim=n_params, out_dim=m_points, 
                     hidden_dims=[model_cfg["hidden_dim"]]*3)
@@ -82,15 +96,12 @@ def main():
         model = ResFFNN(in_dim=n_params, out_dim=m_points, 
                         hidden_dim=model_cfg["hidden_dim"], 
                         num_blocks=model_cfg["num_blocks"])
+    elif model_type == "CorrectionNet":
+        model = CorrectionNet(n_params=n_params, m_points=m_points)
     elif model_type == "DeepONet":
         model = DeepONet(n_params=n_params, 
                         hidden_dim=model_cfg["hidden_dim"], 
                         latent_dim=model_cfg["latent_dim"])
-        # Pre-create the spatial grid based on config
-        # Shape: [M, 1]
-        x_grid = torch.linspace(cfg["data"]["x_min"],
-                                cfg["data"]["x_max"],
-                                cfg["data"]["M"]).to(device).unsqueeze(-1)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -99,7 +110,9 @@ def main():
     # 4. Setup Optimizer and Loss
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
-    criterion = weighted_mse_loss
+    # Standard MSE is too sensitive to the "empty" space. 
+    # Huber Loss is more robust for sharp peaks.
+    criterion = nn.HuberLoss(delta=0.5)
 
     best_val_loss = float("inf")
     model_dir = "./models"
@@ -111,6 +124,9 @@ def main():
     # Early stopping parameters
     patience = 15
     counter = 0
+    # Get stats once to pass to the analytic function
+    p_mean = train_ds.dataset.p_mean if isinstance(train_ds, Subset) else train_ds.p_mean
+    p_std = train_ds.dataset.p_std if isinstance(train_ds, Subset) else train_ds.p_std
     for epoch in range(epochs):
         # --- TRAIN ---
         model.train()
@@ -124,10 +140,17 @@ def main():
 
             optimizer.zero_grad()
             if model_type == "DeepONet":
+                p = p * p_std.to(p.device) + p_mean.to(p.device)
                 preds = model(p, x_grid)
+            elif model_type == "CorrectionNet":
+                preds = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
             else:
                 preds = model(p)
-            loss = criterion(preds, u)
+            #loss = criterion(preds, u)
+            loss = torch.mean(
+                torch.norm(preds - u, dim=1) /
+                (torch.norm(u, dim=1) + 1e-6)
+            )
             loss.backward()
             optimizer.step()
 
@@ -142,8 +165,18 @@ def main():
         with torch.no_grad():
             for p, u in val_loader:
                 p, u = p.to(device), u.to(device)
-                preds = model(p, x_grid) if model_type == "DeepONet" else model(p)
-                loss = criterion(preds, u)
+                if model_type == "DeepONet":
+                    p = p * p_std.to(p.device) + p_mean.to(p.device)
+                    preds = model(p, x_grid)
+                elif model_type == "CorrectionNet":
+                    preds = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
+                else:
+                    preds = model(p)
+                #loss = criterion(preds, u)
+                loss = torch.mean(
+                    torch.norm(preds - u, dim=1) /
+                    (torch.norm(u, dim=1) + 1e-6)
+                )
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)

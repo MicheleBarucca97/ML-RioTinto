@@ -15,7 +15,9 @@ def params_to_function(params, x_grid, n_gaussians):
     for i in range(n_gaussians):
         A = params[:, 3*i + 0][:, None]  # Shape (N, 1)
         c = params[:, 3*i + 1][:, None]
-        s = np.abs(params[:, 3*i + 2][:, None]) + 1e-6  # Ensure positive width
+        # Convert log10_s back to linear s for the Gaussian formula
+        s_log = params[:, 3*i + 2][:, None]
+        s = 10**s_log + 1e-9
 
         # Gaussian formula: A * exp(-0.5 * ((x-c)/s)^2)
         u += A * np.exp(-0.5 * ((x_grid[None, :] - c) / s) ** 2)
@@ -41,13 +43,14 @@ def generate():
     print("Generating parameters...")
     # A ~ U[-1, 1], c ~ U[min, max], s ~ U[0.02, 0.25]
     A = np.random.uniform(-1, 1, (total_samples, n_gaussians))
-    c = np.random.uniform(cfg["data"]["x_min"],
-                          cfg["data"]["x_max"],
+    c = np.random.uniform(x_min,
+                          x_max,
                           (total_samples, n_gaussians))
     s = np.random.uniform(0.02, 0.25, (total_samples, n_gaussians))
+    s_log = np.log10(s) # This turns 0.02 into ~ -1.7 and 0.25 into ~ -0.6
 
     # Interleave parameters: [A1, c1, s1, A2, c2, s2...]
-    P = np.stack([A, c, s], axis=2) \
+    P = np.stack([A, c, s_log], axis=2) \
         .reshape(total_samples, -1) \
         .astype(np.float32)
 

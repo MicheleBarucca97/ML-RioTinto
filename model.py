@@ -55,81 +55,80 @@ class ResFFNN(nn.Module):
             x = block(x)
         return self.output_proj(x)
 
+class CorrectionNet(nn.Module):
+    def __init__(self, n_params, m_points):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_params, 64),
+            nn.SiLU(),
+            nn.Linear(64, m_points)
+        )
+
+    def forward(self, p):
+        return self.net(p)
 
 class FourierFeatureEncoding(nn.Module):
-    def __init__(self, in_dim, num_feats, sigma=1.0):
+    def __init__(self, in_dim, num_feats, sigma=10.0):
         super().__init__()
         # Random Gaussian matrix for projecting coordinates
         self.register_buffer("B", torch.randn(in_dim, num_feats) * sigma)
 
     def forward(self, x):
-        # x: [Batch, dim]
-        # Project: x @ B -> [Batch, num_feats]
-        # Output: [sin(proj), cos(proj)] -> [Batch, 2 * num_feats]
+        # x: [Batch, dim] or [M, dim]
         proj = x @ self.B
         return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
 
-
 class DeepONet(nn.Module):
-    def __init__(self, n_params, hidden_dim=128, latent_dim=128):
+    def __init__(self, n_params, hidden_dim=512, latent_dim=128, num_fourier_feats=128):
         super().__init__()
-
-        # --- BRANCH NET (Processes Parameters) ---
-        # Input: The 30 Gaussian params (or 24 Currents later)
-        self.branch = nn.Sequential(
-            nn.Linear(n_params, hidden_dim),
+        
+        # --- BRANCH NET (The "Set-based" logic) ---
+        # Instead of Linear(30, ...), we use Linear(3, ...)
+        # This forces the model to learn the logic of ONE Gaussian and apply it to all.
+        self.branch_local = nn.Sequential(
+            nn.Linear(3, hidden_dim),
             nn.SiLU(),
-            nn.Dropout(p=0.05),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Dropout(p=0.05),
-            nn.Linear(hidden_dim, latent_dim)  # Output size: P
+            nn.Linear(hidden_dim, latent_dim)
         )
-
-        # --- TRUNK NET (Processes Coordinates) ---
-        # Input: Spatial coordinate x (dim=1) or (x,y) (dim=2)
-        # We use Fourier Features to help it learn sharp changes
-        self.fourier = FourierFeatureEncoding(in_dim=1, num_feats=128, sigma=50.0)
-
-        # Trunk input size is 2 * num_feats (sin + cos)
+        
+        # --- TRUNK NET (Spatial structure) ---
+        self.fourier = FourierFeatureEncoding(in_dim=1, num_feats=num_fourier_feats, sigma=30.0)
+        trunk_in_dim = 2 * num_fourier_feats
+        
         self.trunk = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+            nn.Linear(trunk_in_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, latent_dim)  # Output size: P
+            nn.Linear(hidden_dim, latent_dim)
         )
 
-        # Bias for the final scalar output
         self.bias = nn.Parameter(torch.zeros(1))
 
+        # IMPORTANT: Initialize weights smaller so the SUM doesn't explode
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+
     def forward(self, params, x):
-        # params: [Batch, n_params]
-        # x:      [M_points, 1] OR [Batch, M_points, 1]
+        # 1. Reshape params: [Batch, 30] -> [Batch, 10, 3]
+        B_size = params.shape[0]
+        params = params.view(B_size, 10, 3) 
+        
+        # 2. Branch: Process each Gaussian, then Sum (Superposition Principle)
+        # Output of branch_local: [Batch, 10, latent_dim]
+        branch_latents = self.branch_local(params)
+        # Summing over the 10 Gaussians: [Batch, latent_dim]
+        B = torch.sum(branch_latents, dim=1)
 
-        # 1. Branch Output: [Batch, P]
-        B = self.branch(params)
+        # 3. Trunk: Process spatial grid
+        # x is [M, 1] -> [M, 2*num_feats] -> [M, latent_dim]
+        x_encoded = self.fourier(x)
+        T = self.trunk(x_encoded)
 
-        # 2. Trunk Output: [M_points, P] or [Batch, M_points, P]
-        if x.dim() == 2:  # Shared grid for the whole batch [M, 1]
-            x_encoded = self.fourier(x)
-            # [M, P]
-            T = self.trunk(x_encoded)
-            # Combine using batch matrix-vector multiplication
-            # [Batch, P] @ [P, M] -> [Batch, M]
-            output = torch.matmul(B, T.t()) + self.bias
-
-        else:  # Unique grid per sample [Batch, M, 1]
-            batch_size, m_points, _ = x.shape
-            x_flat = x.reshape(-1, 1)
-            x_encoded = self.fourier(x_flat)
-            T_flat = self.trunk(x_encoded)
-            # [Batch, M, P]
-            T = T_flat.view(batch_size, m_points, -1)
-            # [Batch, 1, P]
-            B_expanded = B.unsqueeze(1)
-            output = torch.sum(B_expanded * T, dim=-1) + self.bias
-
+        # 4. Dot Product (Operator Mapping)
+        # [Batch, latent_dim] @ [latent_dim, M] -> [Batch, M]
+        output = torch.matmul(B, T.t()) + self.bias
         return output

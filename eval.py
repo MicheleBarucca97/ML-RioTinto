@@ -7,8 +7,28 @@ from torch.utils.data import DataLoader
 
 # Import your classes
 from dataset import GaussianDataset
-from model import DeepONet, ResFFNN, FFNN
+from model import DeepONet, ResFFNN, FFNN, CorrectionNet
 
+def analytic_gaussians(params, x, p_mean, p_std):
+    # params is normalized from the DataLoader. 
+    # Denormalize to get real A, c, and log10_s
+    params = params * p_std.to(params.device) + p_mean.to(params.device)
+    
+    # params: [B, 30], x: [M,1]
+    B, _ = params.shape
+    params = params.view(B, -1, 3)  # [B,10,3]
+
+    A = params[..., 0].unsqueeze(-1)
+    c = params[..., 1].unsqueeze(-1)
+    s = (10**params[..., 2] + 1e-9).unsqueeze(-1)
+
+    # x: [M, 1] -> [1, 1, M]
+    x_reshaped = x.view(1, 1, -1)
+
+    return torch.sum(
+        A * torch.exp(-0.5 * ((x_reshaped - c) / s) ** 2),
+        dim=1
+    )  # [B,M]
 
 def evaluate(config_path, model_path, n_plots=5):
     # 1. Load Configuration
@@ -32,6 +52,12 @@ def evaluate(config_path, model_path, n_plots=5):
     n_params = cfg["data"]["n_gaussians"] * 3
     m_points = cfg["data"]["M"]
 
+    # Pre-create the spatial grid based on config
+    # Shape: [M, 1]
+    x_grid = torch.linspace(cfg["data"]["x_min"],
+                                cfg["data"]["x_max"],
+                                cfg["data"]["M"], dtype=torch.float32).to(device).unsqueeze(-1)
+
     if model_type == "FFNN":
         model = FFNN(in_dim=n_params, out_dim=m_points, 
                     hidden_dims=[model_cfg["hidden_dim"]]*3)
@@ -43,15 +69,10 @@ def evaluate(config_path, model_path, n_plots=5):
         model = DeepONet(n_params=n_params, 
                         hidden_dim=model_cfg["hidden_dim"], 
                         latent_dim=model_cfg["latent_dim"])
-        # Pre-create the spatial grid based on config
-        # Shape: [M, 1]
-        x_grid = torch.linspace(cfg["data"]["x_min"],
-                                cfg["data"]["x_max"],
-                                cfg["data"]["M"]).to(device).unsqueeze(-1)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
-    model = model.to(device)
+    model = CorrectionNet(n_params=n_params, m_points=m_points).to(device)
 
     # 4. Load Weights
     # In classical PyTorch, we load the "state_dict"
@@ -66,8 +87,8 @@ def evaluate(config_path, model_path, n_plots=5):
 
     # Retrieve normalization stats from the dataset object
     # They are tensors on CPU, we move them to the device for calculation
-    u_mean = test_ds.u_mean.to(device)
-    u_std = test_ds.u_std.to(device)
+    p_mean = test_ds.p_mean.to(device)
+    p_std = test_ds.p_std.to(device)
 
     print("Running inference...")
     with torch.no_grad():
@@ -76,14 +97,16 @@ def evaluate(config_path, model_path, n_plots=5):
             u = u.to(device)  # This is the normalized target
 
             # Predict
-            if model_type == "DeepONet":
+            '''if model_type == "DeepONet":
                 preds_norm = model(p, x_grid)
             else:
-                preds_norm = model(p)
+                preds_norm = model(p)'''
 
+            preds_real = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
             # Denormalize: Real = Norm * Std + Mean
-            preds_real = preds_norm * u_std + u_mean
-            targets_real = u * u_std + u_mean
+            #preds_real = preds_norm * u_std + u_mean
+            #targets_real = u * u_std + u_mean
+            targets_real = u 
 
             all_preds.append(preds_real.cpu().numpy())
             all_targets.append(targets_real.cpu().numpy())
@@ -98,7 +121,7 @@ def evaluate(config_path, model_path, n_plots=5):
     rmse = np.sqrt(mse)
     diff_norm = np.linalg.norm(preds - targets, axis=1)
     target_norm = np.linalg.norm(targets, axis=1)
-    rel_l2 = diff_norm / target_norm
+    rel_l2 = diff_norm / (target_norm + 1e-12)
 
     print("=" * 40)
     print(f"Results on {len(preds)} test samples:")
