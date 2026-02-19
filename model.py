@@ -67,68 +67,58 @@ class CorrectionNet(nn.Module):
     def forward(self, p):
         return self.net(p)
 
-class FourierFeatureEncoding(nn.Module):
-    def __init__(self, in_dim, num_feats, sigma=10.0):
+class FourierEncoding(nn.Module):
+    def __init__(self, in_dim=1, num_feats=128, sigma=3.):
         super().__init__()
-        # Random Gaussian matrix for projecting coordinates
-        self.register_buffer("B", torch.randn(in_dim, num_feats) * sigma)
+        B = torch.randn(in_dim, num_feats) * sigma
+        self.register_buffer("B", B)
 
     def forward(self, x):
-        # x: [Batch, dim] or [M, dim]
-        proj = x @ self.B
+        proj = 2 * torch.pi * x @ self.B
         return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
 
+# -------------------------------------------------
+# DeepONet operator
+# -------------------------------------------------
 class DeepONet(nn.Module):
-    def __init__(self, n_params, hidden_dim=512, latent_dim=128, num_fourier_feats=128):
+    def __init__(self, m_sensors=100, spatial_dim=1, hidden_dim=256, latent_dim=128):
         super().__init__()
         
-        # --- BRANCH NET (The "Set-based" logic) ---
-        # Instead of Linear(30, ...), we use Linear(3, ...)
-        # This forces the model to learn the logic of ONE Gaussian and apply it to all.
-        self.branch_local = nn.Sequential(
-            nn.Linear(3, hidden_dim),
+        # --- BRANCH NETWORK ---
+        # Takes the 100 discrete sensor readings of the input function
+        self.branch = nn.Sequential(
+            nn.Linear(m_sensors, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, latent_dim)
         )
         
-        # --- TRUNK NET (Spatial structure) ---
-        self.fourier = FourierFeatureEncoding(in_dim=1, num_feats=num_fourier_feats, sigma=30.0)
-        trunk_in_dim = 2 * num_fourier_feats
+        # --- TRUNK NETWORK (Fourier-Embedded) ---
+        num_fourier_feats = 64 # Yields an output dim of 128 (64 sin + 64 cos)
+        # We use a high sigma (~20.0) to capture the sharp 0.02 width of your Gaussians
+        self.fourier = FourierEncoding(spatial_dim, num_fourier_feats, sigma=20.0)
         
         self.trunk = nn.Sequential(
-            nn.Linear(trunk_in_dim, hidden_dim),
+            # Input is now the 128D Fourier feature vector, NOT the 1D raw coordinate
+            nn.Linear(num_fourier_feats * 2, hidden_dim), 
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, latent_dim)
         )
-
+        
         self.bias = nn.Parameter(torch.zeros(1))
 
-        # IMPORTANT: Initialize weights smaller so the SUM doesn't explode
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-
-    def forward(self, params, x):
-        # 1. Reshape params: [Batch, 30] -> [Batch, 10, 3]
-        B_size = params.shape[0]
-        params = params.view(B_size, 10, 3) 
+    def forward(self, u_sensors, zeta):
+        """
+        u_sensors: [Batch, m_sensors] (The function readings)
+        zeta: [M, spatial_dim] (The spatial grid to evaluate on)
+        """
+        B = self.branch(u_sensors)  
         
-        # 2. Branch: Process each Gaussian, then Sum (Superposition Principle)
-        # Output of branch_local: [Batch, 10, latent_dim]
-        branch_latents = self.branch_local(params)
-        # Summing over the 10 Gaussians: [Batch, latent_dim]
-        B = torch.sum(branch_latents, dim=1)
-
-        # 3. Trunk: Process spatial grid
-        # x is [M, 1] -> [M, 2*num_feats] -> [M, latent_dim]
-        x_encoded = self.fourier(x)
-        T = self.trunk(x_encoded)
-
-        # 4. Dot Product (Operator Mapping)
-        # [Batch, latent_dim] @ [latent_dim, M] -> [Batch, M]
-        output = torch.matmul(B, T.t()) + self.bias
-        return output
+        # Pass spatial coordinates through the Fourier feature map first
+        zeta_emb = self.fourier(zeta)
+        T = self.trunk(zeta_emb)        
+        
+        return torch.matmul(B, T.t()) + self.bias

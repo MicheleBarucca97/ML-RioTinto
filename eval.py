@@ -56,8 +56,11 @@ def evaluate(config_path, model_path, n_plots=5):
     # Shape: [M, 1]
     x_grid = torch.linspace(cfg["data"]["x_min"],
                                 cfg["data"]["x_max"],
-                                cfg["data"]["M"], dtype=torch.float32).to(device).unsqueeze(-1)
-
+                                cfg["data"]["M"], dtype=torch.float32).view(-1, 1).to(device)
+    m_sensors = 100  # For DeepONet, we use 100 sensors to read the input function
+    # Fixed locations where the Branch network "looks" at the input function
+    x_sensors = torch.linspace(cfg["data"]["x_min"], cfg["data"]["x_max"], m_sensors).view(-1, 1).to(device)
+    
     if model_type == "FFNN":
         model = FFNN(in_dim=n_params, out_dim=m_points, 
                     hidden_dims=[model_cfg["hidden_dim"]]*3)
@@ -65,14 +68,14 @@ def evaluate(config_path, model_path, n_plots=5):
         model = ResFFNN(in_dim=n_params, out_dim=m_points, 
                         hidden_dim=model_cfg["hidden_dim"], 
                         num_blocks=model_cfg["num_blocks"])
+    elif model_type == "CorrectionNet":
+        model = CorrectionNet(n_params=n_params, m_points=m_points)
     elif model_type == "DeepONet":
-        model = DeepONet(n_params=n_params, 
-                        hidden_dim=model_cfg["hidden_dim"], 
-                        latent_dim=model_cfg["latent_dim"])
+        model = DeepONet(m_sensors=m_sensors)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
-    model = CorrectionNet(n_params=n_params, m_points=m_points).to(device)
+    model = model.to(device)
 
     # 4. Load Weights
     # In classical PyTorch, we load the "state_dict"
@@ -95,20 +98,22 @@ def evaluate(config_path, model_path, n_plots=5):
         for p, u in test_loader:
             p = p.to(device)
             u = u.to(device)  # This is the normalized target
-
-            # Predict
-            '''if model_type == "DeepONet":
-                preds_norm = model(p, x_grid)
+            
+            # Generate predictions based on model type
+            if model_type == "DeepONet":
+                # DeepONet requires sensor readings and the evaluation grid
+                u_sensors = analytic_gaussians(p, x_sensors, p_mean, p_std)
+                preds = model(u_sensors, x_grid)
+            elif model_type == "CorrectionNet":
+                # CorrectionNet adds its output to the analytical base
+                preds = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
             else:
-                preds_norm = model(p)'''
-
-            preds_real = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
-            # Denormalize: Real = Norm * Std + Mean
-            #preds_real = preds_norm * u_std + u_mean
-            #targets_real = u * u_std + u_mean
+                # Standard models (FFNN, ResFFNN) just take the parameters
+                preds = model(p)
+            
             targets_real = u 
 
-            all_preds.append(preds_real.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
             all_targets.append(targets_real.cpu().numpy())
 
     # Concatenate all batches into big arrays
@@ -131,10 +136,7 @@ def evaluate(config_path, model_path, n_plots=5):
     print("=" * 40)
 
     # 7. Plotting
-    # Load x_grid manually just for plotting (it's in the HDF5 metadata)
-    import h5py
-    with h5py.File(h5_path, "r") as f:
-        x_grid = f["x_grid"][:]
+    x_grid_plot = x_grid.cpu().numpy().flatten()
 
     # Select random indices
     indices = np.random.choice(len(preds), n_plots, replace=False)
@@ -145,9 +147,9 @@ def evaluate(config_path, model_path, n_plots=5):
 
     for i, idx in enumerate(indices):
         ax = axes[i]
-        ax.plot(x_grid, targets[idx], label="Ground Truth", color="black",
+        ax.plot(x_grid_plot, targets[idx], label="Ground Truth", color="black",
                 alpha=0.7, linewidth=2)
-        ax.plot(x_grid, preds[idx], label="Prediction", color="red",
+        ax.plot(x_grid_plot, preds[idx], label="Prediction", color="red",
                 linestyle="--", linewidth=2)
 
         ax.set_title(f"Sample {idx} | RMSE: {rmse[idx]:.4f}")
