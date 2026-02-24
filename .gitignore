@@ -22,6 +22,9 @@ models/
 results_log.txt
 *.log
 
+#images
+*.png
+
 # OS files
 .DS_Store
 Thumbs.db

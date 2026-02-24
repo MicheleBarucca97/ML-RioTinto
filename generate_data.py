@@ -2,6 +2,7 @@ import h5py
 import numpy as np
 import yaml
 import os
+import matplotlib.pyplot as plt
 
 
 def params_to_function(params, x_grid, n_gaussians):
@@ -43,12 +44,18 @@ def generate():
     print("Generating parameters...")
     # A ~ U[-1, 1], c ~ U[min, max], s ~ U[0.02, 0.25]
     A = np.random.uniform(-1, 1, (total_samples, n_gaussians))
-    c = np.random.uniform(x_min,
-                          x_max,
-                          (total_samples, n_gaussians))
     s = np.random.uniform(0.02, 0.25, (total_samples, n_gaussians))
     s_log = np.log10(s) # This turns 0.02 into ~ -1.7 and 0.25 into ~ -0.6
 
+    # --- THE CRITICAL FIX: Fixed Centers ---
+    # Create 10 evenly spaced centers across the domain (e.g., -0.9, -0.7 ... 0.9)
+    # This mirrors your 24 fixed anodes perfectly.
+    fixed_centers = np.linspace(x_min + 0.1, x_max - 0.1, n_gaussians)
+    
+    # Broadcast these fixed centers to all samples.
+    # Shape becomes (total_samples, 10) where every row is identical.
+    c = np.tile(fixed_centers, (total_samples, 1))
+    
     # Interleave parameters: [A1, c1, s1, A2, c2, s2...]
     P = np.stack([A, c, s_log], axis=2) \
         .reshape(total_samples, -1) \
@@ -57,6 +64,10 @@ def generate():
     # Generate Functions (Target)
     print("Computing functions (ground truth)...")
     U = params_to_function(P, x_grid, n_gaussians)
+
+    for i in range(5):
+        plt.plot(x_grid, U[i], label=f"Sample {i} Function")
+        plt.show()
 
     # Compute Normalization Stats (using only Train split conceptually)
     n_train = cfg["data"]["samples"]["train"]

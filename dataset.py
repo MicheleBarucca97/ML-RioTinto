@@ -26,7 +26,7 @@ class GaussianDataset(Dataset):
             u_raw = torch.from_numpy(f[self.split]["U"][idx])
 
         # Normalize
-        p = (p_raw - self.p_mean) / self.p_std
+        p = p_raw #(p_raw - self.p_mean) / self.p_std
         '''
         If the target u is normalized to have mean 0 and std 1, but 
         the physical peaks are all positive and very sharp, the "mean" 

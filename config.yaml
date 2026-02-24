@@ -13,15 +13,15 @@ data:
     test: 100
 
 training:
-  batch_size: 8
-  epochs: 200
+  batch_size: 64
+  epochs: 400
   lr: 1e-3
-  weight_decay: 1e-4
+  weight_decay: 1e-5
   num_workers: 4 # Parallel data loading
   accelerator: "auto" # Auto-selects GPU/MPS/CPU
 
 model:
-  type: "DeepONet" # Options: "FFNN", "ResFFNN", "DeepONet"
+  type: "DirectFieldNet" # Options: "FFNN", "ResFFNN", "DeepONet"
   hidden_dim: 512
   latent_dim: 128
   num_blocks: 4  # For ResFFNN or NeuralOperator

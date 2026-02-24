@@ -7,10 +7,10 @@ import numpy as np
 from tqdm import tqdm
 import os
 import yaml
-
+import matplotlib.pyplot as plt
 # Imports from our files
 from dataset import GaussianDataset
-from model import DeepONet, ResFFNN, FFNN, CorrectionNet
+from model import DeepONet, ResFFNN, FFNN, CorrectionNet, EfficientCoordinateNet, DirectFieldNet
 from utils import set_seed
 
 def analytic_gaussians(params, x, p_mean, p_std):
@@ -39,7 +39,7 @@ def main():
     with open("config.yaml", "r") as f:
         cfg = yaml.safe_load(f)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu" if torch.cuda.is_available() else "cpu"
     # Extract parameters from yaml for cleaner code below
     # (Matches the structure of the uploaded config.yaml)
     seed = cfg["seed"]
@@ -104,15 +104,19 @@ def main():
     elif model_type == "CorrectionNet":
         model = CorrectionNet(n_params=n_params, m_points=M)
     elif model_type == "DeepONet":
-        model = DeepONet(m_sensors=m_sensors)
+        model = DeepONet()
+    elif model_type == "EfficientCoordinateNet":
+        model = EfficientCoordinateNet()
+    elif model_type == "DirectFieldNet":
+        model = DirectFieldNet()
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
     model = model.to(device)
     
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
-    criterion = nn.L1Loss() # Still robust against sparsity
+    criterion = nn.MSELoss()
 
     best_val_loss = float("inf")
     model_dir = "./models"
@@ -121,9 +125,8 @@ def main():
 
     # 5. Training Loop
     print(f"Starting training on {device} for {epochs} epochs...")
-    print(f"Spatial samples per batch: {n_points}\n")
     # Early stopping parameters
-    patience = 15
+    patience = 30
     counter = 0
     # Get stats once to pass to the analytic function
     p_mean = train_ds.dataset.p_mean if isinstance(train_ds, Subset) else train_ds.p_mean
@@ -136,25 +139,79 @@ def main():
 
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}",
                     leave=False)
-
+        
         for p, u in loop:
             p, u = p.to(device), u.to(device)
 
-            # --- THE LOOP CHANGE: Generate Sensor Readings ---
-            with torch.no_grad():
-                # We use your analytic_gaussians to figure out what the function 
-                # looks like specifically at the x_sensors locations.
-                u_sensors = analytic_gaussians(p, x_sensors, p_mean, p_std)
-
             optimizer.zero_grad()
+
             if model_type == "DeepONet":
-                preds = model(u_sensors, x_grid)
-            elif model_type == "CorrectionNet":
-                preds = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
+                x = x_grid.clone().detach().requires_grad_(True)
+                # --- FORWARD PASS ---
+                preds = model(p, x)       # [Batch, n_points]
+
+                # --- LOSS COMPUTATION ---
+                grad_pred = torch.autograd.grad(
+                outputs=preds,
+                inputs=x,                  # Differentiate with respect to 'x'
+                grad_outputs=torch.ones_like(preds),
+                create_graph=True,         # Crucial for backpropagating through the derivative
+                retain_graph=True
+                )[0] 
+                
+                # (The rest of your loss computation remains exactly the same)
+                dx = x[1, 0] - x[0, 0]
+                grad_true_fd = (u[:, 1:] - u[:, :-1]) / dx
+                
+                # Align shapes (since finite diff loses one point)
+                grad_pred_aligned = grad_pred.squeeze(-1).unsqueeze(0).expand(p.shape[0], -1) 
+                grad_pred_aligned = grad_pred_aligned[:, :-1] 
+                
+                loss_u = criterion(preds, u)
+                loss_grad = criterion(grad_pred_aligned, grad_true_fd)
+                
+                loss = loss_u + 0.1 * loss_grad
+            elif model_type == "EfficientCoordinateNet":
+                x = x_grid.clone().detach().requires_grad_(True)
+                # --- FORWARD PASS ---
+                preds = model(p, x)       # [Batch, n_points]
+
+                # --- LOSS COMPUTATION ---
+                grad_pred = torch.autograd.grad(
+                outputs=preds,
+                inputs=x,                  # Differentiate with respect to 'x'
+                grad_outputs=torch.ones_like(preds),
+                create_graph=True,         # Crucial for backpropagating through the derivative
+                retain_graph=True
+                )[0] 
+                
+                # (The rest of your loss computation remains exactly the same)
+                dx = x[1, 0] - x[0, 0]
+                grad_true_fd = (u[:, 1:] - u[:, :-1]) / dx
+                
+                # Align shapes (since finite diff loses one point)
+                grad_pred_aligned = grad_pred.squeeze(-1).unsqueeze(0).expand(p.shape[0], -1) 
+                grad_pred_aligned = grad_pred_aligned[:, :-1] 
+                
+                # 1. Peak-Weighted Data Loss
+                # Multiply the squared error by a weight that is higher where 'u' is large
+                weight = 1.0 + 5.0 * torch.abs(u) 
+                loss_u = torch.mean(weight * (preds - u)**2)
+                loss_grad = criterion(grad_pred_aligned, grad_true_fd)
+                
+                loss = loss_u
             else:
-                preds = model(p)
-            loss = criterion(preds, u)
+                # Fallback for standard MLPs that output the full 2560 grid
+                if model_type == "CorrectionNet":
+                    preds = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
+                else:
+                    preds = model(p)
+                    
+                loss = criterion(preds, u)
+
+            # Backpropagation
             loss.backward()
+
             optimizer.step()
 
             train_loss += loss.item()
@@ -169,12 +226,28 @@ def main():
             for p, u in val_loader:
                 p, u = p.to(device), u.to(device)
                 
-                # We also need sensor readings for validation
-                u_sensors = analytic_gaussians(p, x_sensors, p_mean, p_std)
-                
-                preds = model(u_sensors, x_grid)
+                if model_type == "DeepONet":
+                    preds = model(p, x_grid)
+                elif model_type == "EfficientCoordinateNet":
+                    preds = model(p, x_grid)
+                else:
+                    if model_type == "CorrectionNet":
+                        preds = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
+                    else:
+                        preds = model(p)
                 error = torch.norm(preds - u, dim=1) / (torch.norm(u, dim=1) + 1e-6)
                 val_rel_l2 += error.mean().item()
+
+                # --- NEW PLOTTING CODE (Run only once per epoch) ---
+                if epoch % 5 == 0 and p.shape[0] == batch_size: # Just to plot occasionally
+                    plt.figure(figsize=(8, 4))
+                    # Plot the first sample in the batch
+                    plt.plot(x_grid.cpu().numpy(), u[0].cpu().numpy(), label="Ground Truth (u)", color='blue')
+                    plt.plot(x_grid.cpu().numpy(), preds[0].cpu().numpy(), label="Prediction", color='red', linestyle='dashed')
+                    plt.title(f"Epoch {epoch+1} - Val Rel L2: {error[0].item():.4f}")
+                    plt.legend()
+                    plt.savefig(f"val_plot_epoch_{epoch+1}.png")
+                    plt.close()
         
         avg_val_rel_l2 = val_rel_l2 / len(val_loader)
         # --- STEP THE SCHEDULER ---
