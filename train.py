@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from dataset import GaussianDataset
-from utils import build_model, load_x_grid, set_seed
+from utils import build_model, load_x_grid, set_seed, fit_pod_basis_if_needed
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +188,9 @@ def main(config_path: str):
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=train_cfg["epochs"], eta_min=1e-6
     )
+
+    # --- POD basis fitting (no-op for all models except POD_MLP) ---
+    fit_pod_basis_if_needed(model, train_ds, device)
 
     # --- Training loop ---
     grad_weight      = train_cfg.get("grad_loss_weight", 0.1)

@@ -1,5 +1,5 @@
 """
-Shared utilities: seeding, model factory.
+Shared utilities: seeding, model factory, POD basis fitting.
 
 The model factory (build_model) is the single source of truth for
 instantiation, used by both train.py and evaluate.py.
@@ -11,10 +11,12 @@ import h5py
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from models import (
-    FFNN, ResFFNN, DirectFieldNet, CNNDecoder,
+    FFNN, ResFFNN, DirectFieldNet, CNNDecoder, CNNDecoder3D,
     DeepONet, EfficientCoordinateNet, DeepSetsCoordinateNet,
+    POD_MLP,
 )
 
 
@@ -68,6 +70,7 @@ def build_model(cfg: dict) -> nn.Module:
     M           = cfg["data"].get("M") or cfg["data"]["grid_res"] ** 3
     spatial_dim = cfg["data"]["spatial_dim"]
     benchmark   = cfg.get("benchmark", "1d")
+    grid_res    = cfg["data"].get("grid_res", 15)
 
     if model_type in _1D_ONLY and benchmark != "1d":
         raise ValueError(
@@ -79,6 +82,7 @@ def build_model(cfg: dict) -> nn.Module:
     hidden_dim = model_cfg.get("hidden_dim", 256)
     latent_dim = model_cfg.get("latent_dim", 128)
     num_blocks = model_cfg.get("num_blocks", 4)
+    n_modes    = model_cfg.get("n_modes", 40)
 
     if model_type == "FFNN":
         return FFNN(in_dim=n_params, out_dim=M,
@@ -94,6 +98,14 @@ def build_model(cfg: dict) -> nn.Module:
 
     if model_type == "CNNDecoder":
         return CNNDecoder(in_dim=n_params)
+
+    if model_type == "CNNDecoder3D":
+        return CNNDecoder3D(n_params=n_params, grid_res=grid_res,
+                            base_ch=model_cfg.get("base_ch", 128))
+
+    if model_type == "POD_MLP":
+        return POD_MLP(n_params=n_params, n_nodes=M, n_modes=n_modes,
+                       hidden_dim=hidden_dim, num_blocks=num_blocks)
 
     if model_type == "DeepONet":
         return DeepONet(n_params=n_params, spatial_dim=spatial_dim,
@@ -113,3 +125,36 @@ def build_model(cfg: dict) -> nn.Module:
         f"Unknown model type '{model_type}'. "
         f"Add it to utils.build_model() and models.py."
     )
+
+
+# ---------------------------------------------------------------------------
+# POD basis fitting helper
+# ---------------------------------------------------------------------------
+
+def fit_pod_basis_if_needed(model: nn.Module, dataset, device: str):
+    """Fit the POD basis for POD_MLP models.
+
+    This must be called once BEFORE the training loop starts.  It loads all
+    training field snapshots U in one pass, moves them to CPU for SVD, and
+    calls model.fit().  The fitted basis (V, u_mean) is stored as registered
+    buffers so it will be saved and restored with the model's state_dict.
+
+    For all other model types this is a no-op.
+
+    Args:
+        model:   The model returned by build_model().
+        dataset: The training Dataset (or Subset thereof).
+        device:  Target device string (used only for reporting).
+    """
+    if not isinstance(model, POD_MLP):
+        return
+
+    print("Fitting POD basis on all training snapshots…")
+    # Load all U at once; SVD is done on CPU regardless of training device
+    loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False,
+                        num_workers=0)
+    _, U_all = next(iter(loader))        # [N_train, M]
+    model.fit(U_all.cpu())
+    # Move fitted buffers to the training device
+    model.V      = model.V.to(device)
+    model.u_mean = model.u_mean.to(device)

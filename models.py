@@ -8,19 +8,46 @@ Uniform forward signature
     p      : [B, n_params]      parameter vector
     x_grid : [M, spatial_dim]   spatial coordinates (1-D or 3-D)
 
-Grid-free models (FFNN, ResFFNN, DirectFieldNet, CNNDecoder) ignore x_grid
+Grid-free models (FFNN, ResFFNN, DirectFieldNet, CNNDecoder*) ignore x_grid
 but accept it so callers never need to branch on model type.
 
 Benchmark compatibility
 -----------------------
-    1-D and 3-D : FFNN, ResFFNN, DirectFieldNet, DeepONet, EfficientCoordinateNet
-    1-D only    : CNNDecoder       (hardcoded convolutional topology)
-                  DeepSetsCoordinateNet  (encodes (A, center, sigma) triplets;
-                                          3-D inputs have no center in P)
+    1-D and 3-D : FFNN, ResFFNN, DirectFieldNet,
+                  DeepONet, EfficientCoordinateNet, POD_MLP, CNNDecoder3D  
+    1-D only    : CNNDecoder          (fixed 1-D convolutional topology)
+                  DeepSetsCoordinateNet  (needs (A, center, sigma) triplets)
+
+Architecture guide for the 3-D fixed-mesh case
+-----------------------------------------------
+Why not plain DeepONet?
+  DeepONet's trunk re-evaluates ALL M coordinates at every forward pass.
+  On a fixed mesh this wastes compute — the trunk output is always the same
+  matrix.  You can cache it, but that just recovers POD_MLP (see below).
+
+POD_MLP  (recommended starting point)
+  Offline:  compute the top-k POD/PCA modes V from training snapshots.
+  Online:   MLP predicts the k scalar coefficients; decode = c @ V.T + mean.
+  Why it works:  sum-of-Gaussians fields live on a very low-dimensional
+  manifold (≈10-30 modes capture >99 % variance).  The regression problem
+  shrinks from [B→3375] to [B→k], which is far easier with 1 000 samples.
+  Cost:    one SVD offline; then a small MLP at inference.  Very fast.
+
+CNNDecoder3D
+  Learns a spatial inductive bias (nearby voxels are correlated) via 3-D
+  transposed convolutions.  Better than a flat MLP when fields are smooth.
+  Works on the structured 15³ grid; AdaptiveAvgPool3d makes it resolution-
+  agnostic at the end.
+
+Nonlinear autoencoder + MLP  (future work — not implemented here)
+  Replace the linear POD basis with a convolutional autoencoder trained on
+  U.  Superior when fields have sharp gradients that POD cannot compress well.
+  Needs more data (≥5 000 samples) to train the encoder stably.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +207,224 @@ class CNNDecoder(nn.Module):
     def forward(self, p, x_grid=None):
         h = self.fc(p).view(-1, 64, 40)
         return self.decoder(h).squeeze(1)                    # [B, 2560]
+
+
+# ---------------------------------------------------------------------------
+# 3-D convolutional decoder  (3-D structured grids)
+# ---------------------------------------------------------------------------
+
+class CNNDecoder3D(nn.Module):
+    """3-D extension of CNNDecoder using ConvTranspose3d.
+
+    Architecture
+    ------------
+    p [B, n_params]
+        → Linear → [B, C * seed³]
+        → reshape → [B, C, seed, seed, seed]           (seed = 2)
+        → ConvTranspose3d ×3  (each doubles spatial dims)
+        → [B, 32, 16, 16, 16]
+        → AdaptiveAvgPool3d(grid_res)                  (handles any target size)
+        → Conv3d(32→1, k=1)
+        → flatten → [B, grid_res³]
+
+    Memory note: for grid_res=15, the peak activation is [B, 32, 16, 16, 16]
+    ≈ 2 MB per sample at float32.  Scale back the channel widths if you use
+    a much larger grid.
+
+    Args:
+        n_params:  Number of input parameters.
+        grid_res:  Spatial resolution of the target cube (output is grid_res³).
+        base_ch:   Number of channels in the widest convolutional layer.
+    """
+
+    _SEED = 2          # initial spatial size before upsampling
+
+    def __init__(self, n_params: int = 48, grid_res: int = 15,
+                 base_ch: int = 128):
+        super().__init__()
+        self.grid_res = grid_res
+        seed = self._SEED
+
+        # Project param vector to a tiny 3-D feature map
+        self.fc = nn.Linear(n_params, base_ch * (seed ** 3))
+
+        # Three doubling stages: seed → 2s → 4s → 8s
+        # ConvTranspose3d(in, out, k=4, s=2, p=1) doubles spatial dims exactly
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose3d(base_ch,      base_ch // 2, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, base_ch // 2),
+            nn.GELU(),
+
+            nn.ConvTranspose3d(base_ch // 2, base_ch // 4, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, base_ch // 4),
+            nn.GELU(),
+
+            nn.ConvTranspose3d(base_ch // 4, 32,           kernel_size=4, stride=2, padding=1),
+            nn.GELU(),
+        )
+        # After decoder: [B, 32, 8*seed, 8*seed, 8*seed]
+
+        # Resolution-agnostic pooling to exactly grid_res³
+        self.pool = nn.AdaptiveAvgPool3d(grid_res)
+
+        # 1×1×1 conv: 32 channels → 1 (the scalar field value)
+        self.head = nn.Conv3d(32, 1, kernel_size=1)
+
+    def forward(self, p, x_grid=None):
+        B = p.shape[0]
+        seed = self._SEED
+        base_ch = self.fc.out_features // (seed ** 3)
+
+        h = self.fc(p).view(B, base_ch, seed, seed, seed)   # [B, C, 2, 2, 2]
+        h = self.decoder(h)                                  # [B, 32, 16, 16, 16]
+        h = self.pool(h)                                     # [B, 32, G, G, G]
+        h = self.head(h)                                     # [B, 1, G, G, G]
+        return h.view(B, -1)                                 # [B, G³]
+
+
+# ---------------------------------------------------------------------------
+# POD-MLP  (best default for 3-D fixed-mesh problems)
+# ---------------------------------------------------------------------------
+
+class POD_MLP(nn.Module):
+    """POD/PCA-based linear decoder + MLP coefficient predictor.
+
+    Theory
+    ------
+    Any set of training fields U ∈ R^{N×M} admits a low-rank approximation
+
+        U ≈ U_mean  +  C  @  V.T          C ∈ R^{N×k},  V ∈ R^{M×k}
+
+    where V contains the top-k POD modes (right singular vectors of the
+    centred snapshot matrix), and C are the projection coefficients.
+
+    At training time we learn an MLP:  P → C_pred.
+    At inference:  U_pred = C_pred @ V.T + U_mean.
+
+    Why this beats plain DeepONet on a fixed mesh:
+      - DeepONet's trunk is a LEARNED linear decoder: branch(p) @ trunk(x).T
+        On a fixed mesh, trunk(x) is constant — it is equivalent to a learned
+        basis matrix.  POD_MLP replaces this with the analytically-optimal
+        linear basis (Eckart-Young theorem), which requires far fewer training
+        samples to work well.
+      - The regression target shrinks from M ≈ 3 375 to k ≈ 20–50 scalars,
+        which is trivial even with 1 000 training samples.
+
+    How many modes k?
+      Run `model.explained_variance_ratio_` after calling fit() to see the
+      cumulative variance curve.  For sum-of-Gaussians with 24 fixed sources,
+      typically k ≈ 30 captures >99 % of variance.
+
+    Usage
+    -----
+        model = POD_MLP(n_params=48, n_nodes=3375, n_modes=40)
+
+        # Before training — fit the POD basis on all training U snapshots
+        model.fit(U_train_tensor)            # U_train: [N_train, M]
+
+        # Standard training loop (no changes needed)
+        preds = model(p_batch, x_grid)       # [B, M]
+
+    State dict / checkpointing
+    --------------------------
+    The mode matrix V and u_mean ARE included in state_dict (they are
+    registered buffers), so torch.save / torch.load works transparently.
+    You do NOT need to call fit() again after loading a checkpoint.
+
+    Args:
+        n_params:   Dimensionality of the input parameter vector.
+        n_nodes:    Number of mesh nodes M (output dimensionality).
+        n_modes:    Number of POD modes k to keep.
+        hidden_dim: Width of the residual MLP.
+        num_blocks: Depth of the residual MLP.
+    """
+
+    def __init__(self, n_params: int, n_nodes: int, n_modes: int = 40,
+                 hidden_dim: int = 256, num_blocks: int = 4):
+        super().__init__()
+        self.n_modes = n_modes
+
+        # Buffers are saved in state_dict; initialized to zeros so the key
+        # always exists even before fit() is called.
+        self.register_buffer("V",      torch.zeros(n_nodes, n_modes))
+        self.register_buffer("u_mean", torch.zeros(n_nodes))
+        self._fitted = False
+
+        # MLP: predicts k coefficients from the parameter vector
+        self.mlp = ResFFNN(n_params, n_modes, hidden_dim, num_blocks)
+
+    # ------------------------------------------------------------------
+    # Offline fitting
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def fit(self, U: torch.Tensor):
+        """Compute the POD basis from training snapshots.
+
+        Uses the economy Gram-matrix trick (O(N²M) rather than O(NM²)) when
+        the number of samples N is smaller than the number of nodes M, which
+        is the common case in engineering surrogate modelling.
+
+        Args:
+            U: Tensor of shape [N, M] containing ALL training field snapshots
+               (un-normalised raw values, as returned by GaussianDataset).
+        """
+        U = U.float()
+        N, M = U.shape
+
+        u_mean = U.mean(0)                      # [M]
+        Uc = U - u_mean                         # [N, M] centred
+
+        if N <= M:
+            # Gram trick: eigendecompose the small N×N covariance matrix
+            G = Uc @ Uc.T / (N - 1)            # [N, N]
+            eigvals, eigvecs = torch.linalg.eigh(G)   # ascending order
+
+            # Take top-k (eigh returns ascending, so reverse)
+            k = min(self.n_modes, N - 1)
+            idx = torch.arange(N - 1, N - 1 - k, -1)
+            eigvecs_top = eigvecs[:, idx]        # [N, k]
+            eigvals_top = eigvals[idx]           # [k]
+
+            # Right singular vectors: V = Uc.T @ phi / ||...||
+            V = Uc.T @ eigvecs_top               # [M, k]
+            norms = V.norm(dim=0, keepdim=True).clamp(min=1e-9)
+            V = V / norms                        # [M, k]  orthonormal modes
+        else:
+            # Full SVD (only if N > M, unusual)
+            _, _, Vh = torch.linalg.svd(Uc, full_matrices=False)
+            V = Vh[:self.n_modes].T              # [M, k]
+
+        self.V.copy_(V)
+        self.u_mean.copy_(u_mean)
+        self._fitted = True
+
+        # Store explained variance for diagnostics
+        total_var = (Uc ** 2).sum()
+        recon_var = ((Uc @ V) @ V.T).pow(2).sum()
+        self.explained_variance_ratio_ = float(recon_var / (total_var + 1e-9))
+        print(f"  POD basis fitted: {self.n_modes} modes, "
+              f"explained variance = {self.explained_variance_ratio_:.4f}")
+
+    # ------------------------------------------------------------------
+    # Encode / decode helpers (useful for analysis)
+    # ------------------------------------------------------------------
+
+    def encode(self, U: torch.Tensor) -> torch.Tensor:
+        """Project physical fields → coefficient space. [B, M] → [B, k]"""
+        return (U - self.u_mean) @ self.V
+
+    def decode(self, C: torch.Tensor) -> torch.Tensor:
+        """Reconstruct physical fields from coefficients. [B, k] → [B, M]"""
+        return C @ self.V.T + self.u_mean
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(self, p, x_grid=None):
+        C_pred = self.mlp(p)                     # [B, k]
+        return self.decode(C_pred)               # [B, M]
 
 
 # ---------------------------------------------------------------------------

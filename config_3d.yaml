@@ -23,11 +23,26 @@ training:
   grad_loss_weight: 0.0 # gradient loss is not meaningful on an unstructured 3-D mesh
 
 model:
-  # Compatible: FFNN | ResFFNN | DirectFieldNet
-  #             DeepONet | EfficientCoordinateNet
-  # NOT compatible: CNNDecoder (fixed 1-D topology)
-  #                 DeepSetsCoordinateNet (encodes (A, center, sigma) triplets — no centers in 3-D input)
-  type: "DeepONet"
+  # ── Recommended for 3-D fixed-mesh with ≤1 000 training samples ─────────
+  # POD_MLP: analytically-optimal linear basis + small MLP.  Fast, sample-
+  #          efficient.  Try this first.  Set n_modes using the explained-
+  #          variance printout after the first epoch.
+  #
+  # CNNDecoder3D: 3-D convolutional decoder.  Good spatial inductive bias.
+  #               Works on structured grids of any resolution.
+  #
+  # Also compatible (but less efficient on fixed mesh):
+  #   FFNN | ResFFNN | DirectFieldNet | DeepONet | EfficientCoordinateNet
+  #
+  # NOT compatible:
+  #   CNNDecoder          — fixed 1-D topology
+  #   DeepSetsCoordinateNet — requires (A, center, sigma) triplets in P
+  # ─────────────────────────────────────────────────────────────────────────
+  type: "POD_MLP"
   hidden_dim: 256
   latent_dim: 128
   num_blocks: 4
+  n_modes: 40           # POD_MLP only: number of POD modes to keep.
+                        # Run once, check explained_variance_ratio_ printout,
+                        # then increase/decrease as needed.
+  base_ch: 128          # CNNDecoder3D only: channel width of widest conv layer

@@ -13,6 +13,7 @@ env/
 # Data and models (too large for git)
 data/
 models/
+plots/
 *.pth
 *.h5
 *.ckpt
