@@ -19,7 +19,7 @@ models/
 *.weights
 
 # Results/logs
-results_log.txt
+*.txt
 *.log
 
 #images
