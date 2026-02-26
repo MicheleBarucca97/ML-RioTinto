@@ -1,275 +1,231 @@
+"""
+Training script — works with any benchmark (1-D or 3-D).
+
+Usage
+-----
+    python train.py --config config_1d.yaml
+    python train.py --config config_3d.yaml
+"""
+
+import argparse
+import os
+
+import matplotlib
+matplotlib.use("Agg")   # headless-safe; must come before pyplot import
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.utils.data import DataLoader, Subset
-import numpy as np
-from tqdm import tqdm
-import os
 import yaml
-import matplotlib.pyplot as plt
-# Imports from our files
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
+
 from dataset import GaussianDataset
-from model import DeepONet, ResFFNN, FFNN, CorrectionNet, EfficientCoordinateNet, DirectFieldNet
-from utils import set_seed
+from utils import build_model, load_x_grid, set_seed
 
-def analytic_gaussians(params, x, p_mean, p_std):
-    # params is normalized from the DataLoader. 
-    # Denormalize to get real A, c, and log10_s
-    params = params * p_std.to(params.device) + p_mean.to(params.device)
-    
-    # params: [B, 30], x: [M,1]
-    B, _ = params.shape
-    params = params.view(B, -1, 3)  # [B,10,3]
 
-    A = params[..., 0].unsqueeze(-1)
-    c = params[..., 1].unsqueeze(-1)
-    s = (10**params[..., 2] + 1e-9).unsqueeze(-1)
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
 
-    # x: [M, 1] -> [1, 1, M]
-    x_reshaped = x.view(1, 1, -1)
+def sobolev_loss(preds: torch.Tensor, targets: torch.Tensor,
+                 grad_weight: float = 0.1) -> torch.Tensor:
+    """MSE on values + weighted MSE on finite-difference gradients.
 
-    return torch.sum(
-        A * torch.exp(-0.5 * ((x_reshaped - c) / s) ** 2),
-        dim=1
-    )  # [B,M]
+    The gradient term penalises wrong slopes and helps with sharp features.
+    Set grad_weight=0 to use plain MSE (recommended for 3-D / unstructured meshes).
+    """
+    loss = nn.functional.mse_loss(preds, targets)
+    if grad_weight > 0:
+        slope_pred = preds[:, 1:]   - preds[:, :-1]
+        slope_true = targets[:, 1:] - targets[:, :-1]
+        loss = loss + grad_weight * nn.functional.mse_loss(slope_pred, slope_true)
+    return loss
 
-def main():
-    # 1. Load Configuration
-    with open("config.yaml", "r") as f:
+
+# ---------------------------------------------------------------------------
+# Per-epoch routines
+# ---------------------------------------------------------------------------
+
+def train_epoch(model, loader, optimizer, x_grid, grad_weight, device):
+    model.train()
+    total_loss = 0.0
+    for p, u in tqdm(loader, desc="  train", leave=False):
+        p, u = p.to(device), u.to(device)
+        optimizer.zero_grad()
+        loss = sobolev_loss(model(p, x_grid), u, grad_weight)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+
+@torch.no_grad()
+def val_epoch(model, loader, x_grid, device, epoch, cfg,
+              save_plot_every: int = 5):
+    model.eval()
+    total_rel_l2 = 0.0
+    benchmark = cfg.get("benchmark", "1d")
+
+    for batch_idx, (p, u) in enumerate(loader):
+        p, u = p.to(device), u.to(device)
+        preds = model(p, x_grid)
+        rel_l2 = (
+            torch.norm(preds - u, dim=1) /
+            (torch.norm(u, dim=1) + 1e-6)
+        ).mean()
+        total_rel_l2 += rel_l2.item()
+
+        if batch_idx == 0 and epoch % save_plot_every == 0:
+            _save_val_plot(x_grid, u[0], preds[0], rel_l2.item(),
+                           epoch, benchmark, cfg)
+
+    return total_rel_l2 / len(loader)
+
+
+# ---------------------------------------------------------------------------
+# Plotting helpers
+# ---------------------------------------------------------------------------
+
+def _save_val_plot(x_grid, u, pred, rel_l2, epoch, benchmark, cfg):
+    os.makedirs("plots", exist_ok=True)
+    path = f"plots/val_epoch_{epoch + 1:04d}.png"
+
+    if benchmark == "1d":
+        _plot_1d(x_grid, u, pred, rel_l2, epoch, path)
+    else:
+        _plot_3d_slice(x_grid, u, pred, rel_l2, epoch, cfg, path)
+
+
+def _plot_1d(x_grid, u, pred, rel_l2, epoch, path):
+    x = x_grid.cpu().numpy().flatten()
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(x, u.cpu().numpy(),    label="Ground Truth", color="steelblue", lw=1.5)
+    ax.plot(x, pred.cpu().numpy(), label="Prediction",   color="tomato",
+            linestyle="--", lw=1.5)
+    ax.set_title(f"Epoch {epoch + 1}  |  Rel-L2 = {rel_l2:.4f}")
+    ax.legend()
+    fig.savefig(path, dpi=80)
+    plt.close(fig)
+
+
+def _plot_3d_slice(x_grid, u, pred, rel_l2, epoch, cfg, path):
+    """Show the z≈0 slice as a colour map (ground truth vs prediction)."""
+    grid_res = cfg["data"]["grid_res"]
+    coords   = x_grid.cpu().numpy()
+    z_vals   = np.unique(coords[:, 2])
+    z_mid    = z_vals[len(z_vals) // 2]
+    mask     = np.isclose(coords[:, 2], z_mid)
+
+    xs = coords[mask, 0].reshape(grid_res, grid_res)
+    ys = coords[mask, 1].reshape(grid_res, grid_res)
+    u_slice    = u.cpu().numpy()[mask].reshape(grid_res, grid_res)
+    pred_slice = pred.cpu().numpy()[mask].reshape(grid_res, grid_res)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    for ax, data, title in zip(axes,
+                                [u_slice, pred_slice],
+                                ["Ground Truth", "Prediction"]):
+        im = ax.pcolormesh(xs, ys, data, cmap="RdBu_r", shading="auto")
+        plt.colorbar(im, ax=ax)
+        ax.set_title(title)
+        ax.set_aspect("equal")
+    fig.suptitle(f"Epoch {epoch + 1}  |  z≈{z_mid:.2f}  |  Rel-L2 = {rel_l2:.4f}")
+    fig.savefig(path, dpi=80)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(config_path: str):
+    with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    device = "cpu" if torch.cuda.is_available() else "cpu"
-    # Extract parameters from yaml for cleaner code below
-    # (Matches the structure of the uploaded config.yaml)
-    seed = cfg["seed"]
-    h5_path = cfg["data"]["h5_path"]
-    batch_size = cfg["training"]["batch_size"]
-    lr = float(cfg["training"]["lr"])
-    weight_decay = float(cfg["training"]["weight_decay"])
-    epochs = cfg["training"]["epochs"]
-    model_cfg = cfg["model"]
-    model_type = model_cfg["type"]
-    n_params = cfg["data"]["n_gaussians"] * 3
-    M = cfg["data"]["M"]
-    # Number of sampled spatial points per batch
-    # (critical hyperparameter)
-    n_points = min(512, M)
+    set_seed(cfg["seed"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Benchmark : {cfg.get('benchmark', '1d')}")
+    print(f"Device    : {device}")
 
-    set_seed(seed)
+    # --- Data ---
+    h5_path    = cfg["data"]["h5_path"]
+    train_cfg  = cfg["training"]
 
-    # --- Prepare Data ---
-    print(f"Loading data from {h5_path}...")
     train_ds = GaussianDataset(h5_path, split="train")
-    val_ds = GaussianDataset(h5_path, split="val")
+    val_ds   = GaussianDataset(h5_path, split="val")
 
     if cfg["data"].get("use_subset", False):
-        num_train_samples = cfg["data"]["samples"]["train"]
-        
-        # Use a local generator for reproducibility
-        rng = np.random.default_rng(seed)
-        indices = np.arange(len(train_ds))
-        rng.shuffle(indices)
-        
-        # Wrap the dataset in a Subset
-        train_indices = indices[:num_train_samples]
-        train_ds = Subset(train_ds, train_indices)
-        print(f"Using a subset of {num_train_samples} training samples.")
+        n_sub    = cfg["data"].get("subset_size", cfg["data"]["samples"]["train"])
+        rng      = np.random.default_rng(cfg["seed"])
+        indices  = rng.permutation(len(train_ds))[:n_sub]
+        train_ds = Subset(train_ds, indices)
+        print(f"Subset    : {n_sub} training samples")
     else:
-        print(f"Using full training set: {len(train_ds)} samples.")
+        print(f"Train set : {len(train_ds)} samples")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size,
-                              shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=4)
+    num_workers = train_cfg.get("num_workers", 4)
+    train_loader = DataLoader(train_ds, batch_size=train_cfg["batch_size"],
+                              shuffle=True, num_workers=num_workers,
+                              pin_memory=(device == "cuda"))
+    val_loader   = DataLoader(val_ds,   batch_size=train_cfg["batch_size"],
+                              shuffle=False, num_workers=num_workers)
 
-    # Pre-create the spatial grid based on config
-    # Shape: [M, 1]
-    x_grid = torch.linspace(cfg["data"]["x_min"],
-                            cfg["data"]["x_max"],
-                            M, dtype=torch.float32
-                            ).view(-1, 1).to(device)
+    # Spatial grid — loaded from the HDF5 file (correct shape for any benchmark)
+    x_grid = load_x_grid(cfg, device)
+    print(f"x_grid    : {tuple(x_grid.shape)}")
 
     # --- Model ---
-    m_sensors = 100  # For DeepONet, we use 100 sensors to read the input function
-    # Fixed locations where the Branch network "looks" at the input function
-    x_sensors = torch.linspace(cfg["data"]["x_min"], cfg["data"]["x_max"], m_sensors).view(-1, 1).to(device)
-    if model_type == "FFNN":
-        model = FFNN(in_dim=n_params, out_dim=M, 
-                    hidden_dims=[model_cfg["hidden_dim"]]*3)
-    elif model_type == "ResFFNN":
-        model = ResFFNN(in_dim=n_params, out_dim=M, 
-                        hidden_dim=model_cfg["hidden_dim"], 
-                        num_blocks=model_cfg["num_blocks"])
-    elif model_type == "CorrectionNet":
-        model = CorrectionNet(n_params=n_params, m_points=M)
-    elif model_type == "DeepONet":
-        model = DeepONet()
-    elif model_type == "EfficientCoordinateNet":
-        model = EfficientCoordinateNet()
-    elif model_type == "DirectFieldNet":
-        model = DirectFieldNet()
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+    model    = build_model(cfg).to(device)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model     : {cfg['model']['type']}  ({n_params:,} parameters)")
 
-    model = model.to(device)
-    
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
-    criterion = nn.MSELoss()
+    # --- Optimizer & scheduler ---
+    optimizer = optim.AdamW(model.parameters(),
+                            lr=float(train_cfg["lr"]),
+                            weight_decay=float(train_cfg["weight_decay"]))
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=train_cfg["epochs"], eta_min=1e-6
+    )
 
-    best_val_loss = float("inf")
-    model_dir = "./models"
-    os.makedirs(model_dir, exist_ok=True)
-    save_path = os.path.join(model_dir, "best_model.pth")
+    # --- Training loop ---
+    grad_weight      = train_cfg.get("grad_loss_weight", 0.1)
+    patience         = train_cfg.get("patience", 30)
+    best_val_loss    = float("inf")
+    patience_counter = 0
 
-    # 5. Training Loop
-    print(f"Starting training on {device} for {epochs} epochs...")
-    # Early stopping parameters
-    patience = 30
-    counter = 0
-    # Get stats once to pass to the analytic function
-    p_mean = train_ds.dataset.p_mean if isinstance(train_ds, Subset) else train_ds.p_mean
-    p_std = train_ds.dataset.p_std if isinstance(train_ds, Subset) else train_ds.p_std
+    os.makedirs("models", exist_ok=True)
+    save_path = "models/best_model.pth"
 
-    for epoch in range(epochs):
-        # --- TRAIN ---
-        model.train()
-        train_loss = 0.0
+    print(f"\nTraining for up to {train_cfg['epochs']} epochs…\n")
+    for epoch in range(train_cfg["epochs"]):
+        train_loss = train_epoch(model, train_loader, optimizer,
+                                 x_grid, grad_weight, device)
+        val_loss   = val_epoch(model, val_loader, x_grid, device, epoch, cfg)
+        scheduler.step()
 
-        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}",
-                    leave=False)
-        
-        for p, u in loop:
-            p, u = p.to(device), u.to(device)
+        lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch + 1:4d}  "
+              f"train={train_loss:.5f}  val_rel_l2={val_loss:.5f}  lr={lr:.2e}")
 
-            optimizer.zero_grad()
-
-            if model_type == "DeepONet":
-                x = x_grid.clone().detach().requires_grad_(True)
-                # --- FORWARD PASS ---
-                preds = model(p, x)       # [Batch, n_points]
-
-                # --- LOSS COMPUTATION ---
-                grad_pred = torch.autograd.grad(
-                outputs=preds,
-                inputs=x,                  # Differentiate with respect to 'x'
-                grad_outputs=torch.ones_like(preds),
-                create_graph=True,         # Crucial for backpropagating through the derivative
-                retain_graph=True
-                )[0] 
-                
-                # (The rest of your loss computation remains exactly the same)
-                dx = x[1, 0] - x[0, 0]
-                grad_true_fd = (u[:, 1:] - u[:, :-1]) / dx
-                
-                # Align shapes (since finite diff loses one point)
-                grad_pred_aligned = grad_pred.squeeze(-1).unsqueeze(0).expand(p.shape[0], -1) 
-                grad_pred_aligned = grad_pred_aligned[:, :-1] 
-                
-                loss_u = criterion(preds, u)
-                loss_grad = criterion(grad_pred_aligned, grad_true_fd)
-                
-                loss = loss_u + 0.1 * loss_grad
-            elif model_type == "EfficientCoordinateNet":
-                x = x_grid.clone().detach().requires_grad_(True)
-                # --- FORWARD PASS ---
-                preds = model(p, x)       # [Batch, n_points]
-
-                # --- LOSS COMPUTATION ---
-                grad_pred = torch.autograd.grad(
-                outputs=preds,
-                inputs=x,                  # Differentiate with respect to 'x'
-                grad_outputs=torch.ones_like(preds),
-                create_graph=True,         # Crucial for backpropagating through the derivative
-                retain_graph=True
-                )[0] 
-                
-                # (The rest of your loss computation remains exactly the same)
-                dx = x[1, 0] - x[0, 0]
-                grad_true_fd = (u[:, 1:] - u[:, :-1]) / dx
-                
-                # Align shapes (since finite diff loses one point)
-                grad_pred_aligned = grad_pred.squeeze(-1).unsqueeze(0).expand(p.shape[0], -1) 
-                grad_pred_aligned = grad_pred_aligned[:, :-1] 
-                
-                # 1. Peak-Weighted Data Loss
-                # Multiply the squared error by a weight that is higher where 'u' is large
-                weight = 1.0 + 5.0 * torch.abs(u) 
-                loss_u = torch.mean(weight * (preds - u)**2)
-                loss_grad = criterion(grad_pred_aligned, grad_true_fd)
-                
-                loss = loss_u
-            else:
-                # Fallback for standard MLPs that output the full 2560 grid
-                if model_type == "CorrectionNet":
-                    preds = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
-                else:
-                    preds = model(p)
-                    
-                loss = criterion(preds, u)
-
-            # Backpropagation
-            loss.backward()
-
-            optimizer.step()
-
-            train_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
-
-        avg_train_loss = train_loss / len(train_loader)
-
-        # --- VALIDATION ---
-        model.eval()
-        val_rel_l2 = 0.0
-        with torch.no_grad():
-            for p, u in val_loader:
-                p, u = p.to(device), u.to(device)
-                
-                if model_type == "DeepONet":
-                    preds = model(p, x_grid)
-                elif model_type == "EfficientCoordinateNet":
-                    preds = model(p, x_grid)
-                else:
-                    if model_type == "CorrectionNet":
-                        preds = analytic_gaussians(p, x_grid, p_mean, p_std) + model(p)
-                    else:
-                        preds = model(p)
-                error = torch.norm(preds - u, dim=1) / (torch.norm(u, dim=1) + 1e-6)
-                val_rel_l2 += error.mean().item()
-
-                # --- NEW PLOTTING CODE (Run only once per epoch) ---
-                if epoch % 5 == 0 and p.shape[0] == batch_size: # Just to plot occasionally
-                    plt.figure(figsize=(8, 4))
-                    # Plot the first sample in the batch
-                    plt.plot(x_grid.cpu().numpy(), u[0].cpu().numpy(), label="Ground Truth (u)", color='blue')
-                    plt.plot(x_grid.cpu().numpy(), preds[0].cpu().numpy(), label="Prediction", color='red', linestyle='dashed')
-                    plt.title(f"Epoch {epoch+1} - Val Rel L2: {error[0].item():.4f}")
-                    plt.legend()
-                    plt.savefig(f"val_plot_epoch_{epoch+1}.png")
-                    plt.close()
-        
-        avg_val_rel_l2 = val_rel_l2 / len(val_loader)
-        # --- STEP THE SCHEDULER ---
-        # The scheduler needs to see the validation loss to decide if it should drop the LR
-        scheduler.step(avg_val_rel_l2)
-        # --- LOGGING ---
-        # It's helpful to see the current LR in your logs
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.6f} | Val Loss={avg_val_rel_l2:.6f} | LR={current_lr:.2e}")
-
-        # Inside the loop, after validation
-        if avg_val_rel_l2 < best_val_loss:
-            best_val_loss = avg_val_rel_l2
+        if val_loss < best_val_loss:
+            best_val_loss    = val_loss
+            patience_counter = 0
             torch.save(model.state_dict(), save_path)
-            counter = 0 # Reset counter
-            print(f"  >>> New best model saved! ({best_val_loss:.6f})")
+            print(f"  ✓ New best saved ({best_val_loss:.5f})")
         else:
-            counter += 1
-            if counter >= patience:
-                print(f"Early stopping triggered at epoch {epoch+1}")
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch + 1}.")
                 break
+
+    print(f"\nDone. Best val rel-L2: {best_val_loss:.5f}")
+    print(f"Best model → {save_path}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+    main(args.config)

@@ -1,0 +1,33 @@
+benchmark: "3d"
+seed: 42
+
+data:
+  h5_path: "./data/gaussian_3d.h5"
+  n_gaussians: 24
+  n_params: 48          # n_gaussians * 2  —  (amplitude, sigma) per Gaussian
+                        # centers are fixed at generation time, not part of the input
+  spatial_dim: 3
+  grid_res: 15          # grid is grid_res^3 = 3375 nodes
+  samples:
+    train: 1000
+    val:   200
+    test:  100
+  use_subset: false
+
+training:
+  batch_size: 32
+  epochs: 400
+  lr: 1.0e-3
+  weight_decay: 1.0e-3
+  patience: 30
+  grad_loss_weight: 0.0 # gradient loss is not meaningful on an unstructured 3-D mesh
+
+model:
+  # Compatible: FFNN | ResFFNN | DirectFieldNet
+  #             DeepONet | EfficientCoordinateNet
+  # NOT compatible: CNNDecoder (fixed 1-D topology)
+  #                 DeepSetsCoordinateNet (encodes (A, center, sigma) triplets — no centers in 3-D input)
+  type: "DeepONet"
+  hidden_dim: 256
+  latent_dim: 128
+  num_blocks: 4

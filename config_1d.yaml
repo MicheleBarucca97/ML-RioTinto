@@ -1,0 +1,32 @@
+benchmark: "1d"
+seed: 42
+
+data:
+  h5_path: "./data/gaussian_1d.h5"
+  n_gaussians: 10
+  n_params: 30          # n_gaussians * 3  —  (A, center, log10_sigma) per Gaussian
+  spatial_dim: 1
+  M: 2560               # number of output grid points
+  x_min: -1.0
+  x_max:  1.0
+  samples:
+    train: 1000
+    val:   100
+    test:  100
+  use_subset: false     # set true + subset_size to train on fewer samples
+
+training:
+  batch_size: 64
+  epochs: 400
+  lr: 1.0e-3
+  weight_decay: 1.0e-3
+  patience: 30          # early-stopping patience (epochs)
+  grad_loss_weight: 0.1 # weight of Sobolev finite-difference gradient term
+
+model:
+  # Compatible: FFNN | ResFFNN | DirectFieldNet | CNNDecoder (1-D only)
+  #             DeepONet | EfficientCoordinateNet | DeepSetsCoordinateNet (1-D only)
+  type: "CNNDecoder"
+  hidden_dim: 512
+  latent_dim: 128
+  num_blocks: 4
