@@ -17,7 +17,7 @@ import os
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-
+from scipy.stats import qmc
 
 # ---------------------------------------------------------------------------
 # Core math
@@ -72,11 +72,32 @@ def generate(cfg: dict, plot: bool = False):
     print(f"[1D] Generating {N} samples "
           f"({n_train} train / {n_val} val / {n_test} test)…")
 
-    # --- Sample parameters ---
-    A     = rng.uniform(-1, 1, (N, n_gaussians)).astype(np.float32)
+    # --- Sample parameters using Sobol sequence ---
+    print("[1D] Generating Sobol sequence for quasi-uniform sampling...")
+    # We have 2 varying parameters (Amplitude, Sigma) per Gaussian
+    n_varying_dims = 2 * n_gaussians
+    # Initialize the Sobol sampler. 
+    # scramble=True adds a random shift (controlled by the seed) to prevent artifacts
+    sampler = qmc.Sobol(d=n_varying_dims, scramble=True, seed=cfg["seed"])
+    # Generate samples in the [0, 1] unit hypercube
+    # Note: Sobol sequences are mathematically perfectly balanced when N is a power of 2.
+    # Scipy will warn you if N is not a power of 2, but with scramble=True, 
+    # it is still vastly superior to standard uniform sampling.
+    sobol_samples = sampler.random(n=N)
+    # Split the dimensions: first half for Amplitude, second half for Sigma
+    sobol_A = sobol_samples[:, :n_gaussians]
+    sobol_s = sobol_samples[:, n_gaussians:]
+    
+    # Scale from [0, 1] bounds to your physical bounds using qmc.scale
+    A = qmc.scale(sobol_A, -1.0, 1.0).astype(np.float32)
+    
+    s_linear = qmc.scale(sobol_s, 0.02, 0.25)
+    s_log = np.log10(s_linear).astype(np.float32)
+
+    '''A     = rng.uniform(-1, 1, (N, n_gaussians)).astype(np.float32)
     s_log = np.log10(
         rng.uniform(0.02, 0.25, (N, n_gaussians))
-    ).astype(np.float32)
+    ).astype(np.float32)'''
 
     # Fixed centers mirroring a "fixed anode" physical setup.
     # Every sample shares the same centers; only A and sigma vary.

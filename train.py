@@ -60,6 +60,41 @@ def train_epoch(model, loader, optimizer, x_grid, grad_weight, device):
         total_loss += loss.item()
     return total_loss / len(loader)
 
+def train_epoch_lbfgs(model, loader, optimizer, x_grid, grad_weight, device):
+    """
+    Specialized training loop for the L-BFGS optimizer.
+    Requires a closure function to re-evaluate the loss multiple times per step.
+    """
+    model.train()
+    total_loss = 0.0
+    
+    for p, u in tqdm(loader, desc="  train (L-BFGS)", leave=False):
+        p, u = p.to(device), u.to(device)
+        
+        # 1. Define the closure inside the batch loop
+        def closure():
+            optimizer.zero_grad()
+            output = model(p, x_grid)
+            
+            # Handle tuple returns if you kept the duck-typing, otherwise just standard
+            preds = output[0] if isinstance(output, tuple) else output
+            
+            loss = sobolev_loss(preds, u, grad_weight)
+            loss.backward()
+            return loss
+            
+        # 2. Step the optimizer using the closure
+        optimizer.step(closure)
+        
+        # 3. Accumulate loss for logging (run a single forward pass without tracking gradients)
+        with torch.no_grad():
+            output = model(p, x_grid)
+            preds = output[0] if isinstance(output, tuple) else output
+            loss = sobolev_loss(preds, u, grad_weight)
+            total_loss += loss.item()
+            
+    return total_loss / len(loader)
+
 
 @torch.no_grad()
 def val_epoch(model, loader, x_grid, device, epoch, cfg,
@@ -201,14 +236,44 @@ def main(config_path: str):
     os.makedirs("models", exist_ok=True)
     save_path = "models/best_model.pth"
 
-    print(f"\nTraining for up to {train_cfg['epochs']} epochs…\n")
-    for epoch in range(train_cfg["epochs"]):
-        train_loss = train_epoch(model, train_loader, optimizer,
-                                 x_grid, grad_weight, device)
-        val_loss   = val_epoch(model, val_loader, x_grid, device, epoch, cfg)
-        scheduler.step()
+    # NEW: Define when to switch to L-BFGS
+    total_epochs = train_cfg["epochs"]
+    lbfgs_epochs = 0 
+    adam_epochs = total_epochs - lbfgs_epochs
 
-        lr = optimizer.param_groups[0]["lr"]
+    print(f"\nTraining for up to {total_epochs} epochs…")
+    print(f"  Phase 1: AdamW for {adam_epochs} epochs")
+    print(f"  Phase 2: L-BFGS for {lbfgs_epochs} epochs\n")
+
+    for epoch in range(total_epochs):
+        
+        # --- NEW: Optimizer Switch Logic ---
+        if epoch == adam_epochs:
+            print("\n>>> Switching optimizer from AdamW to L-BFGS for fine-tuning...\n")
+            # Initialize L-BFGS with a conservative learning rate
+            optimizer = optim.LBFGS(
+                model.parameters(), 
+                lr=0.01, 
+                max_iter=20,     # How many times it refines the step
+                history_size=50, # Memory of past gradients (k in L-BFGS)
+                line_search_fn="strong_wolfe" # Highly recommended to prevent divergence
+            )
+            # Disable the standard scheduler for the L-BFGS phase
+            scheduler = None 
+        # -----------------------------------
+
+        # Route to the correct training function
+        if epoch < adam_epochs:
+            train_loss = train_epoch(model, train_loader, optimizer, x_grid, grad_weight, device)
+            if scheduler:
+                scheduler.step()
+            lr = optimizer.param_groups[0]["lr"]
+        else:
+            train_loss = train_epoch_lbfgs(model, train_loader, optimizer, x_grid, grad_weight, device)
+            lr = optimizer.param_groups[0]["lr"] # L-BFGS lr remains constant
+
+        val_loss = val_epoch(model, val_loader, x_grid, device, epoch, cfg)
+
         print(f"Epoch {epoch + 1:4d}  "
               f"train={train_loss:.5f}  val_rel_l2={val_loss:.5f}  lr={lr:.2e}")
 
@@ -219,9 +284,12 @@ def main(config_path: str):
             print(f"  ✓ New best saved ({best_val_loss:.5f})")
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch + 1}.")
-                break
+            # Only apply early stopping during the Adam phase to ensure L-BFGS gets a chance to run
+            if epoch < adam_epochs and patience_counter >= patience:
+                print(f"Early stopping triggered during Adam phase at epoch {epoch + 1}.")
+                # Fast-forward to L-BFGS phase instead of quitting entirely
+                epoch = adam_epochs - 1 
+                continue
 
     print(f"\nDone. Best val rel-L2: {best_val_loss:.5f}")
     print(f"Best model → {save_path}")

@@ -153,7 +153,7 @@ def evaluate(config_path: str, model_path: str, n_plots: int = 5):
     # --- Data ---
     h5_path = cfg["data"]["h5_path"]
     test_ds = GaussianDataset(h5_path, split="test")
-    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=2)
+    test_loader = DataLoader(test_ds, batch_size=16, shuffle=False, num_workers=2)
     print(f"Test set  : {len(test_ds)} samples")
 
     x_grid = load_x_grid(cfg, device)

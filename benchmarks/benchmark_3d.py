@@ -23,7 +23,7 @@ import os
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-
+from scipy.stats import qmc
 
 # ---------------------------------------------------------------------------
 # Core math
@@ -109,8 +109,16 @@ def generate(cfg: dict, plot: bool = False):
                                   (n_gaussians, 3)).astype(np.float32)
 
     # --- Sample per-sample parameters ---
-    A     = rng.uniform(0.1, 1.0, (N, n_gaussians)).astype(np.float32)
-    sigma = rng.uniform(0.1, 0.3, (N, n_gaussians)).astype(np.float32)
+    n_varying_dims = 2 * n_gaussians 
+    sampler = qmc.Sobol(d=n_varying_dims, scramble=True, seed=cfg["seed"])
+    sobol_samples = sampler.random(n=N)
+    sobol_A = sobol_samples[:, :n_gaussians]
+    sobol_s = sobol_samples[:, n_gaussians:]
+    # Scale from [0, 1] bounds to your physical bounds using qmc.scale
+    A = qmc.scale(sobol_A, 0.1, 1.0).astype(np.float32)
+    sigma = qmc.scale(sobol_s, 0.1, 0.3).astype(np.float32)
+    '''A     = rng.uniform(0.1, 1.0, (N, n_gaussians)).astype(np.float32)
+    sigma = rng.uniform(0.1, 0.3, (N, n_gaussians)).astype(np.float32)'''
 
     # Input vector: [amplitudes | spreads]  →  [N, n_gaussians * 2]
     P = np.concatenate([A, sigma], axis=1)

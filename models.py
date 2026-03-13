@@ -48,7 +48,7 @@ Nonlinear autoencoder + MLP  (future work — not implemented here)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch.utils.checkpoint import checkpoint
 
 # ---------------------------------------------------------------------------
 # Encoding utilities
@@ -566,3 +566,124 @@ class DeepSetsCoordinateNet(nn.Module):
         ], dim=-1)
         h = self.trunk(self.trunk_in_proj(h))
         return self.head(h).squeeze(-1)                      # [B, M]
+
+
+import torch_geometric.nn as pyg_nn
+
+# ---------------------------------------------------------------------------
+# Graph Neural Network (GNN / MeshGraphNet)
+# ---------------------------------------------------------------------------
+
+class GraphBlock(pyg_nn.MessagePassing):
+    """A single message-passing block."""
+    def __init__(self, hidden_dim: int):
+        # aggr='mean' is highly stable for continuous physical fields
+        super().__init__(aggr='mean') 
+        
+        # Edge MLP: Computes the "message" from source node to target node
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim), nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        # Node MLP: Updates the node state using the aggregated messages
+        self.node_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim), nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+    def forward(self, x, edge_index):
+        # 1. Propagate calls message() and aggregates the results across edges
+        agg_msg = self.propagate(edge_index, x=x)
+        # 2. Update node features
+        out = self.node_mlp(torch.cat([x, agg_msg], dim=-1))
+        return x + out  # Residual connection
+
+    def message(self, x_i, x_j):
+        # x_i is the target node, x_j is the source node
+        return self.edge_mlp(torch.cat([x_i, x_j], dim=-1))
+
+
+class MeshGraphNet(nn.Module):
+    """
+    GNN that builds the graph internally on the fly.
+    Requires zero changes to the standard DataLoader or training loop!
+    """
+    def __init__(self, n_params: int, grid_res: int = 15, 
+                 hidden_dim: int = 128, num_layers: int = 6):
+        super().__init__()
+        self.grid_res = grid_res
+        
+        # 1. Generate the static edge connectivity for the 3D grid once
+        base_edge_index = self._create_3d_grid_edges(grid_res)
+        self.register_buffer("base_edge_index", base_edge_index)
+        
+        # 2. Encoders and Decoders
+        # Input to node is: [x, y, z] + [p1, p2, ..., p48]
+        self.node_encoder = nn.Sequential(
+            nn.Linear(n_params + 3, hidden_dim), nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Message passing layers
+        self.processor = nn.ModuleList([
+            GraphBlock(hidden_dim) for _ in range(num_layers)
+        ])
+        
+        # Map hidden dimension back to a single scalar (the physical field)
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2), nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def _create_3d_grid_edges(self, res: int) -> torch.Tensor:
+        """Creates the 6-way connectivity list for the benchmark grid."""
+        edges = []
+        for i in range(res):
+            for j in range(res):
+                for k in range(res):
+                    curr = i * (res**2) + j * res + k
+                    # Connect valid neighbors
+                    if i > 0: edges.append([curr, (i - 1) * (res**2) + j * res + k])
+                    if i < res - 1: edges.append([curr, (i + 1) * (res**2) + j * res + k])
+                    if j > 0: edges.append([curr, i * (res**2) + (j - 1) * res + k])
+                    if j < res - 1: edges.append([curr, i * (res**2) + (j + 1) * res + k])
+                    if k > 0: edges.append([curr, i * (res**2) + j * res + (k - 1)])
+                    if k < res - 1: edges.append([curr, i * (res**2) + j * res + (k + 1)])
+        return torch.tensor(edges, dtype=torch.long).t().contiguous()
+
+    def forward(self, p, x_grid=None):
+        B = p.shape[0]
+        M = x_grid.shape[0]
+        
+        # 1. Expand parameters and coords to every node
+        p_exp = p.unsqueeze(1).expand(-1, M, -1)     # [B, M, 48]
+        x_exp = x_grid.unsqueeze(0).expand(B, -1, -1) # [B, M, 3]
+        
+        # 2. Flatten into a massive single batch of nodes: [B*M, 51]
+        node_features = torch.cat([x_exp, p_exp], dim=-1).reshape(B * M, -1)
+        
+        # 3. Build the batch edge_index (shift indices for each graph in the batch)
+        # We cache this to avoid recreating it at every single training step
+        if hasattr(self, '_cached_batch_size') and self._cached_batch_size == B:
+            batch_edge_index = self._cached_edge_index
+        else:
+            offsets = (torch.arange(B, device=p.device) * M).view(1, 1, B)
+            # Shape math: [2, E, 1] + [1, 1, B] -> [2, E, B] -> [2, B*E]
+            batch_edge_index = (self.base_edge_index.unsqueeze(2) + offsets).view(2, -1)
+            self._cached_batch_size = B
+            self._cached_edge_index = batch_edge_index
+
+        # 4. GNN Forward Pass
+        h = self.node_encoder(node_features)
+        for block in self.processor:
+            # --- NEW CODE: Gradient Checkpointing ---
+            # use_reentrant=False is the modern PyTorch standard for safety
+            h = checkpoint(block, h, batch_edge_index, use_reentrant=False)
+            #h = block(h, batch_edge_index)
+        out = self.decoder(h)  # [B*M, 1]
+        
+        # 5. Reshape back to [B, M] to match your exact loss function expectations!
+        return out.view(B, M)

@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from models import (
     FFNN, ResFFNN, DirectFieldNet, CNNDecoder, CNNDecoder3D,
     DeepONet, EfficientCoordinateNet, DeepSetsCoordinateNet,
-    POD_MLP,
+    POD_MLP, MeshGraphNet
 )
 
 
@@ -120,6 +120,10 @@ def build_model(cfg: dict) -> nn.Module:
             n_gaussians=cfg["data"]["n_gaussians"],
             hidden_dim=hidden_dim,
         )
+    
+    if model_type == "MeshGraphNet":
+        return MeshGraphNet(n_params=n_params, grid_res=grid_res,
+                            hidden_dim=hidden_dim, num_layers=num_blocks)
 
     raise ValueError(
         f"Unknown model type '{model_type}'. "
