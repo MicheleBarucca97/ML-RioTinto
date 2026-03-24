@@ -37,7 +37,7 @@ model:
   #   CNNDecoder          — fixed 1-D topology
   #   DeepSetsCoordinateNet — requires (A, center, sigma) triplets in P
   # ─────────────────────────────────────────────────────────────────────────
-  type: "MeshGraphNet"
+  type: "FFNN"
   hidden_dim: 256
   latent_dim: 128
   num_blocks: 6         # For MeshGraphNet translates to number of message-passing layers

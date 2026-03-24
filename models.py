@@ -496,6 +496,78 @@ class EfficientCoordinateNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Pointwise FFNN  (parameter + single coordinate → scalar)
+# ---------------------------------------------------------------------------
+
+class PointwiseFFNN(nn.Module):
+    """Maps (parameters, single coordinate) → scalar field value.
+
+    Architecture
+    ------------
+    Two separate encoders for P and x, followed by a shared residual MLP:
+
+        P  →  [param_encoder]  →  p_emb  (hidden_dim)
+        x  →  [Fourier + linear] →  x_emb  (hidden_dim)
+        concat(p_emb, x_emb)  →  [ResidualBlock × num_blocks]  →  scalar
+
+    At inference the model is evaluated at every grid point, producing [B, M].
+    All M evaluations are batched in a single tensor op (no Python loop).
+
+    Compatible with any spatial_dim (1-D or 3-D).
+
+    Args:
+        n_params:        Dimensionality of the input parameter vector.
+        spatial_dim:     Number of spatial dimensions (1 or 3).
+        hidden_dim:      Width of the residual trunk.
+        num_blocks:      Number of residual blocks in the trunk.
+        num_freqs:       Number of Fourier frequency bands for coordinate encoding.
+    """
+
+    def __init__(self, n_params: int = 48, spatial_dim: int = 3,
+                 hidden_dim: int = 256, num_blocks: int = 4,
+                 num_freqs: int = 10):
+        super().__init__()
+
+        self.coord_encoder = MultiScaleFourierEncoding(spatial_dim, num_freqs)
+
+        self.param_encoder = nn.Sequential(
+            nn.Linear(n_params, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.coord_proj = nn.Linear(self.coord_encoder.out_dim, hidden_dim)
+
+        self.trunk = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            *[ResidualBlock(hidden_dim) for _ in range(num_blocks)],
+        )
+
+        self.head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, p, x_grid):
+        """
+        Args:
+            p:      [B, n_params]
+            x_grid: [M, spatial_dim]
+
+        Returns:
+            [B, M]  predicted field values.
+        """
+        B, M = p.shape[0], x_grid.shape[0]
+
+        p_emb = self.param_encoder(p)                               # [B, H]
+        x_emb = self.coord_proj(self.coord_encoder(x_grid))         # [M, H]
+
+        # Broadcast and concatenate: [B, M, 2H]
+        p_emb = p_emb.unsqueeze(1).expand(-1, M, -1)               # [B, M, H]
+        x_emb = x_emb.unsqueeze(0).expand(B, -1, -1)               # [B, M, H]
+        h = torch.cat([p_emb, x_emb], dim=-1)                      # [B, M, 2H]
+
+        h = self.trunk(h)                                           # [B, M, H]
+        return self.head(h).squeeze(-1)                             # [B, M]
+
+
+# ---------------------------------------------------------------------------
 # 1-D-only coordinate model
 # ---------------------------------------------------------------------------
 

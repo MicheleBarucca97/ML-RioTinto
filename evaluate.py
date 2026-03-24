@@ -142,9 +142,14 @@ def _plot_3d(preds, targets, x_grid, metrics, indices, cfg):
 # Main
 # ---------------------------------------------------------------------------
 
-def evaluate(config_path: str, model_path: str, n_plots: int = 5):
+def evaluate(config_path: str, model_path: str | None = None, n_plots: int = 5):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+
+    # Default model path uses the model type from config
+    if model_path is None:
+        model_tag  = cfg["model"]["type"]
+        model_path = f"models/best_model_{model_tag}.pth"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Benchmark : {cfg.get('benchmark', '1d')}")
@@ -179,7 +184,8 @@ def evaluate(config_path: str, model_path: str, n_plots: int = 5):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a trained Gaussian model")
     parser.add_argument("--config",  required=True)
-    parser.add_argument("--model",   default="models/best_model.pth")
+    parser.add_argument("--model",   default=None,
+                        help="Path to .pth file (default: models/best_model_<type>.pth)")
     parser.add_argument("--n_plots", type=int, default=5)
     args = parser.parse_args()
     evaluate(args.config, args.model, args.n_plots)

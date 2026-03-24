@@ -8,7 +8,9 @@ Usage
 """
 
 import argparse
+import csv
 import os
+import time
 
 import matplotlib
 matplotlib.use("Agg")   # headless-safe; must come before pyplot import
@@ -172,6 +174,79 @@ def _plot_3d_slice(x_grid, u, pred, rel_l2, epoch, cfg, path):
 
 
 # ---------------------------------------------------------------------------
+# Training statistics
+# ---------------------------------------------------------------------------
+
+def _init_stats_csv(path: str):
+    """Create the CSV file and write the header row."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "val_rel_l2", "lr",
+                          "epoch_time_s", "cumulative_time_s"])
+
+
+def _append_stats_csv(path: str, row: dict):
+    """Append a single epoch row to the CSV."""
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([row["epoch"], row["train_loss"], row["val_rel_l2"],
+                          row["lr"], row["epoch_time_s"],
+                          row["cumulative_time_s"]])
+
+
+def _plot_training_curves(stats_path: str, out_path: str):
+    """Read the CSV log and produce a summary training curves figure."""
+    epochs, train_loss, val_rel_l2, lr, epoch_time = [], [], [], [], []
+    with open(stats_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            epochs.append(int(row["epoch"]))
+            train_loss.append(float(row["train_loss"]))
+            val_rel_l2.append(float(row["val_rel_l2"]))
+            lr.append(float(row["lr"]))
+            epoch_time.append(float(row["epoch_time_s"]))
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # Train loss
+    axes[0, 0].plot(epochs, train_loss, color="steelblue", lw=1.5)
+    axes[0, 0].set_ylabel("Train Loss")
+    axes[0, 0].set_xlabel("Epoch")
+    axes[0, 0].set_yscale("log")
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].set_title("Train Loss")
+
+    # Val rel-L2
+    axes[0, 1].plot(epochs, val_rel_l2, color="tomato", lw=1.5)
+    axes[0, 1].set_ylabel("Val Rel-L2")
+    axes[0, 1].set_xlabel("Epoch")
+    axes[0, 1].set_yscale("log")
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].set_title("Validation Rel-L2")
+
+    # Learning rate
+    axes[1, 0].plot(epochs, lr, color="seagreen", lw=1.5)
+    axes[1, 0].set_ylabel("Learning Rate")
+    axes[1, 0].set_xlabel("Epoch")
+    axes[1, 0].set_yscale("log")
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].set_title("Learning Rate Schedule")
+
+    # Epoch wall-clock time
+    axes[1, 1].bar(epochs, epoch_time, color="slategray", alpha=0.7)
+    axes[1, 1].set_ylabel("Time (s)")
+    axes[1, 1].set_xlabel("Epoch")
+    axes[1, 1].grid(True, alpha=0.3, axis="y")
+    axes[1, 1].set_title("Wall-Clock Time per Epoch")
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Training curves saved -> {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -234,32 +309,37 @@ def main(config_path: str):
     patience_counter = 0
 
     os.makedirs("models", exist_ok=True)
-    save_path = "models/best_model.pth"
+    model_tag  = cfg["model"]["type"]
+    save_path  = f"models/best_model_{model_tag}.pth"
 
     # NEW: Define when to switch to L-BFGS
     total_epochs = train_cfg["epochs"]
-    lbfgs_epochs = 0 
+    lbfgs_epochs = 0
     adam_epochs = total_epochs - lbfgs_epochs
+
+    # --- Training statistics log ---
+    stats_csv_path = f"models/training_stats_{model_tag}.csv"
+    _init_stats_csv(stats_csv_path)
+    cumulative_time = 0.0
 
     print(f"\nTraining for up to {total_epochs} epochs…")
     print(f"  Phase 1: AdamW for {adam_epochs} epochs")
     print(f"  Phase 2: L-BFGS for {lbfgs_epochs} epochs\n")
 
     for epoch in range(total_epochs):
-        
-        # --- NEW: Optimizer Switch Logic ---
+        epoch_start = time.perf_counter()
+
+        # --- Optimizer Switch Logic ---
         if epoch == adam_epochs:
             print("\n>>> Switching optimizer from AdamW to L-BFGS for fine-tuning...\n")
-            # Initialize L-BFGS with a conservative learning rate
             optimizer = optim.LBFGS(
-                model.parameters(), 
-                lr=0.01, 
-                max_iter=20,     # How many times it refines the step
-                history_size=50, # Memory of past gradients (k in L-BFGS)
-                line_search_fn="strong_wolfe" # Highly recommended to prevent divergence
+                model.parameters(),
+                lr=0.01,
+                max_iter=20,
+                history_size=50,
+                line_search_fn="strong_wolfe"
             )
-            # Disable the standard scheduler for the L-BFGS phase
-            scheduler = None 
+            scheduler = None
         # -----------------------------------
 
         # Route to the correct training function
@@ -270,29 +350,47 @@ def main(config_path: str):
             lr = optimizer.param_groups[0]["lr"]
         else:
             train_loss = train_epoch_lbfgs(model, train_loader, optimizer, x_grid, grad_weight, device)
-            lr = optimizer.param_groups[0]["lr"] # L-BFGS lr remains constant
+            lr = optimizer.param_groups[0]["lr"]
 
         val_loss = val_epoch(model, val_loader, x_grid, device, epoch, cfg)
 
+        epoch_time = time.perf_counter() - epoch_start
+        cumulative_time += epoch_time
+
+        # Log to CSV
+        _append_stats_csv(stats_csv_path, {
+            "epoch":           epoch + 1,
+            "train_loss":      f"{train_loss:.6f}",
+            "val_rel_l2":      f"{val_loss:.6f}",
+            "lr":              f"{lr:.2e}",
+            "epoch_time_s":    f"{epoch_time:.2f}",
+            "cumulative_time_s": f"{cumulative_time:.2f}",
+        })
+
         print(f"Epoch {epoch + 1:4d}  "
-              f"train={train_loss:.5f}  val_rel_l2={val_loss:.5f}  lr={lr:.2e}")
+              f"train={train_loss:.5f}  val_rel_l2={val_loss:.5f}  "
+              f"lr={lr:.2e}  time={epoch_time:.1f}s")
 
         if val_loss < best_val_loss:
             best_val_loss    = val_loss
             patience_counter = 0
             torch.save(model.state_dict(), save_path)
-            print(f"  ✓ New best saved ({best_val_loss:.5f})")
+            print(f"  -> New best saved ({best_val_loss:.5f})")
         else:
             patience_counter += 1
-            # Only apply early stopping during the Adam phase to ensure L-BFGS gets a chance to run
             if epoch < adam_epochs and patience_counter >= patience:
                 print(f"Early stopping triggered during Adam phase at epoch {epoch + 1}.")
-                # Fast-forward to L-BFGS phase instead of quitting entirely
-                epoch = adam_epochs - 1 
+                epoch = adam_epochs - 1
                 continue
 
+    # --- Summary ---
     print(f"\nDone. Best val rel-L2: {best_val_loss:.5f}")
-    print(f"Best model → {save_path}")
+    print(f"Total training time : {cumulative_time:.1f}s")
+    print(f"Best model -> {save_path}")
+    print(f"Stats log  -> {stats_csv_path}")
+
+    # Generate training curves plot
+    _plot_training_curves(stats_csv_path, f"models/training_curves_{model_tag}.png")
 
 
 if __name__ == "__main__":
