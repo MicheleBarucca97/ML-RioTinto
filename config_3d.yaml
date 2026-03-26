@@ -2,12 +2,12 @@ benchmark: "3d"
 seed: 42
 
 data:
-  h5_path: "./data/gaussian_3d_sobolsampling.h5"
+  h5_path: "./data/gaussian_3d_finer.h5"
   n_gaussians: 24
   n_params: 48          # n_gaussians * 2  —  (amplitude, sigma) per Gaussian
                         # centers are fixed at generation time, not part of the input
   spatial_dim: 3
-  grid_res: 15          # grid is grid_res^3 = 3375 nodes
+  grid_res: 80          # grid is grid_res^3 = 3375 nodes
   samples:
     train: 500
     val:   200
@@ -30,6 +30,9 @@ model:
   # CNNDecoder3D: 3-D convolutional decoder.  Good spatial inductive bias.
   #               Works on structured grids of any resolution.
   #
+  # PointwiseFFNN: simple MLP applied pointwise to each node.
+  #               No spatial inductive bias.
+  #
   # Also compatible (but less efficient on fixed mesh):
   #   FFNN | ResFFNN | DirectFieldNet | DeepONet | EfficientCoordinateNet
   #
@@ -37,9 +40,9 @@ model:
   #   CNNDecoder          — fixed 1-D topology
   #   DeepSetsCoordinateNet — requires (A, center, sigma) triplets in P
   # ─────────────────────────────────────────────────────────────────────────
-  type: "FFNN"
-  hidden_dim: 256
-  latent_dim: 128
+  type: "PointwiseFFNN"
+  hidden_dim: 512
+  latent_dim: 256
   num_blocks: 6         # For MeshGraphNet translates to number of message-passing layers
   n_modes: 60           # POD_MLP only: number of POD modes to keep.
                         # Run once, check explained_variance_ratio_ printout,
