@@ -1,10 +1,11 @@
 """
-Training script — works with any benchmark (1-D or 3-D).
+Training script — works with any benchmark (1-D, 3-D, or Alucell).
 
 Usage
 -----
     python train.py --config config_1d.yaml
     python train.py --config config_3d.yaml
+    python train.py --config config_alucell.yaml
 """
 
 import argparse
@@ -36,7 +37,8 @@ def sobolev_loss(preds: torch.Tensor, targets: torch.Tensor,
     """MSE on values + weighted MSE on finite-difference gradients.
 
     The gradient term penalises wrong slopes and helps with sharp features.
-    Set grad_weight=0 to use plain MSE (recommended for 3-D / unstructured meshes).
+    Set grad_weight=0 to use plain MSE (recommended for 3-D / unstructured /
+    POD coefficient targets).
     """
     loss = nn.functional.mse_loss(preds, targets)
     if grad_weight > 0:
@@ -63,32 +65,23 @@ def train_epoch(model, loader, optimizer, x_grid, grad_weight, device):
     return total_loss / len(loader)
 
 def train_epoch_lbfgs(model, loader, optimizer, x_grid, grad_weight, device):
-    """
-    Specialized training loop for the L-BFGS optimizer.
-    Requires a closure function to re-evaluate the loss multiple times per step.
-    """
+    """Specialized training loop for the L-BFGS optimizer."""
     model.train()
     total_loss = 0.0
     
     for p, u in tqdm(loader, desc="  train (L-BFGS)", leave=False):
         p, u = p.to(device), u.to(device)
         
-        # 1. Define the closure inside the batch loop
         def closure():
             optimizer.zero_grad()
             output = model(p, x_grid)
-            
-            # Handle tuple returns if you kept the duck-typing, otherwise just standard
             preds = output[0] if isinstance(output, tuple) else output
-            
             loss = sobolev_loss(preds, u, grad_weight)
             loss.backward()
             return loss
             
-        # 2. Step the optimizer using the closure
         optimizer.step(closure)
         
-        # 3. Accumulate loss for logging (run a single forward pass without tracking gradients)
         with torch.no_grad():
             output = model(p, x_grid)
             preds = output[0] if isinstance(output, tuple) else output
@@ -122,20 +115,70 @@ def val_epoch(model, loader, x_grid, device, epoch, cfg,
 
 
 # ---------------------------------------------------------------------------
-# Plotting helpers
+# Validation plotting
 # ---------------------------------------------------------------------------
 
 def _save_val_plot(x_grid, u, pred, rel_l2, epoch, benchmark, cfg):
     os.makedirs("plots", exist_ok=True)
     path = f"plots/val_epoch_{epoch + 1:04d}.png"
 
-    if benchmark == "1d":
-        _plot_1d(x_grid, u, pred, rel_l2, epoch, path)
+    if benchmark == "alucell":
+        _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path)
+    elif benchmark == "1d":
+        _plot_1d_val(x_grid, u, pred, rel_l2, epoch, path)
     else:
-        _plot_3d_slice(x_grid, u, pred, rel_l2, epoch, cfg, path)
+        _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path)
 
 
-def _plot_1d(x_grid, u, pred, rel_l2, epoch, path):
+def _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path):
+    """Validation plot for Alucell: contour on mid-ACD plane or interface."""
+    coords = x_grid.cpu().numpy()
+    M_grid = coords.shape[0]
+    u_np   = u.cpu().numpy()
+    pred_np = pred.cpu().numpy()
+
+    # Vector field (M×3 → magnitude) vs scalar
+    if u_np.shape[0] == M_grid * 3:
+        field_true = np.linalg.norm(u_np.reshape(M_grid, 3), axis=1)
+        field_pred = np.linalg.norm(pred_np.reshape(M_grid, 3), axis=1)
+        label = "|Δu| (m/s)" if "delta" in path.lower() else "|u| (m/s)"
+    elif u_np.shape[0] == M_grid:
+        field_true = u_np
+        field_pred = pred_np
+        label = "field"
+    else:
+        # POD coefficients — bar chart instead of contour
+        fig, ax = plt.subplots(figsize=(10, 4))
+        k = len(u_np)
+        x = np.arange(k)
+        ax.bar(x - 0.15, u_np, width=0.3, label="Truth", color="steelblue")
+        ax.bar(x + 0.15, pred_np, width=0.3, label="Pred",  color="tomato")
+        ax.set_xlabel("POD mode")
+        ax.set_ylabel("Coefficient")
+        ax.set_title(f"Epoch {epoch + 1}  |  Rel-L2 = {rel_l2:.4f}")
+        ax.legend()
+        fig.savefig(path, dpi=80)
+        plt.close(fig)
+        return
+
+    vmin = min(field_true.min(), field_pred.min())
+    vmax = max(field_true.max(), field_pred.max())
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    for ax, data, title in zip(axes,
+                                [field_true, field_pred],
+                                ["Ground Truth", "Prediction"]):
+        sc = ax.tricontourf(coords[:, 0], coords[:, 1], data,
+                            levels=32, cmap="RdBu_r", vmin=vmin, vmax=vmax)
+        plt.colorbar(sc, ax=ax, label=label)
+        ax.set_title(title)
+        ax.set_aspect("equal")
+    fig.suptitle(f"Epoch {epoch + 1}  |  Rel-L2 = {rel_l2:.4f}")
+    fig.savefig(path, dpi=80)
+    plt.close(fig)
+
+
+def _plot_1d_val(x_grid, u, pred, rel_l2, epoch, path):
     x = x_grid.cpu().numpy().flatten()
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(x, u.cpu().numpy(),    label="Ground Truth", color="steelblue", lw=1.5)
@@ -147,8 +190,8 @@ def _plot_1d(x_grid, u, pred, rel_l2, epoch, path):
     plt.close(fig)
 
 
-def _plot_3d_slice(x_grid, u, pred, rel_l2, epoch, cfg, path):
-    """Show the z≈0 slice as a colour map (ground truth vs prediction)."""
+def _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path):
+    """z≈mid slice colour map."""
     grid_res = cfg["data"]["grid_res"]
     coords   = x_grid.cpu().numpy()
     z_vals   = np.unique(coords[:, 2])
@@ -178,7 +221,6 @@ def _plot_3d_slice(x_grid, u, pred, rel_l2, epoch, cfg, path):
 # ---------------------------------------------------------------------------
 
 def _init_stats_csv(path: str):
-    """Create the CSV file and write the header row."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -187,7 +229,6 @@ def _init_stats_csv(path: str):
 
 
 def _append_stats_csv(path: str, row: dict):
-    """Append a single epoch row to the CSV."""
     with open(path, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([row["epoch"], row["train_loss"], row["val_rel_l2"],
@@ -196,7 +237,6 @@ def _append_stats_csv(path: str, row: dict):
 
 
 def _plot_training_curves(stats_path: str, out_path: str):
-    """Read the CSV log and produce a summary training curves figure."""
     epochs, train_loss, val_rel_l2, lr, epoch_time = [], [], [], [], []
     with open(stats_path, "r") as f:
         reader = csv.DictReader(f)
@@ -209,7 +249,6 @@ def _plot_training_curves(stats_path: str, out_path: str):
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-    # Train loss
     axes[0, 0].plot(epochs, train_loss, color="steelblue", lw=1.5)
     axes[0, 0].set_ylabel("Train Loss")
     axes[0, 0].set_xlabel("Epoch")
@@ -217,7 +256,6 @@ def _plot_training_curves(stats_path: str, out_path: str):
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].set_title("Train Loss")
 
-    # Val rel-L2
     axes[0, 1].plot(epochs, val_rel_l2, color="tomato", lw=1.5)
     axes[0, 1].set_ylabel("Val Rel-L2")
     axes[0, 1].set_xlabel("Epoch")
@@ -225,7 +263,6 @@ def _plot_training_curves(stats_path: str, out_path: str):
     axes[0, 1].grid(True, alpha=0.3)
     axes[0, 1].set_title("Validation Rel-L2")
 
-    # Learning rate
     axes[1, 0].plot(epochs, lr, color="seagreen", lw=1.5)
     axes[1, 0].set_ylabel("Learning Rate")
     axes[1, 0].set_xlabel("Epoch")
@@ -233,7 +270,6 @@ def _plot_training_curves(stats_path: str, out_path: str):
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].set_title("Learning Rate Schedule")
 
-    # Epoch wall-clock time
     axes[1, 1].bar(epochs, epoch_time, color="slategray", alpha=0.7)
     axes[1, 1].set_ylabel("Time (s)")
     axes[1, 1].set_xlabel("Epoch")
@@ -243,7 +279,7 @@ def _plot_training_curves(stats_path: str, out_path: str):
     plt.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
-    print(f"Training curves saved -> {out_path}")
+    print(f"Training curves saved → {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +292,8 @@ def main(config_path: str):
 
     set_seed(cfg["seed"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Benchmark : {cfg.get('benchmark', '1d')}")
+    benchmark = cfg.get("benchmark", "1d")
+    print(f"Benchmark : {benchmark}")
     print(f"Device    : {device}")
 
     # --- Data ---
@@ -282,7 +319,6 @@ def main(config_path: str):
     val_loader   = DataLoader(val_ds,   batch_size=train_cfg["batch_size"],
                               shuffle=False, num_workers=num_workers)
 
-    # Spatial grid — loaded from the HDF5 file (correct shape for any benchmark)
     x_grid = load_x_grid(cfg, device)
     print(f"x_grid    : {tuple(x_grid.shape)}")
 
@@ -312,44 +348,39 @@ def main(config_path: str):
     model_tag  = cfg["model"]["type"]
     save_path  = f"models/best_model_{model_tag}.pth"
 
-    # NEW: Define when to switch to L-BFGS
     total_epochs = train_cfg["epochs"]
     lbfgs_epochs = 0
-    adam_epochs = total_epochs - lbfgs_epochs
+    adam_epochs  = total_epochs - lbfgs_epochs
 
-    # --- Training statistics log ---
     stats_csv_path = f"models/training_stats_{model_tag}.csv"
     _init_stats_csv(stats_csv_path)
     cumulative_time = 0.0
 
     print(f"\nTraining for up to {total_epochs} epochs…")
     print(f"  Phase 1: AdamW for {adam_epochs} epochs")
-    print(f"  Phase 2: L-BFGS for {lbfgs_epochs} epochs\n")
+    if lbfgs_epochs:
+        print(f"  Phase 2: L-BFGS for {lbfgs_epochs} epochs")
+    print()
 
     for epoch in range(total_epochs):
         epoch_start = time.perf_counter()
 
-        # --- Optimizer Switch Logic ---
-        if epoch == adam_epochs:
-            print("\n>>> Switching optimizer from AdamW to L-BFGS for fine-tuning...\n")
+        if epoch == adam_epochs and lbfgs_epochs > 0:
+            print("\n>>> Switching to L-BFGS…\n")
             optimizer = optim.LBFGS(
-                model.parameters(),
-                lr=0.01,
-                max_iter=20,
-                history_size=50,
-                line_search_fn="strong_wolfe"
-            )
+                model.parameters(), lr=0.01, max_iter=20,
+                history_size=50, line_search_fn="strong_wolfe")
             scheduler = None
-        # -----------------------------------
 
-        # Route to the correct training function
         if epoch < adam_epochs:
-            train_loss = train_epoch(model, train_loader, optimizer, x_grid, grad_weight, device)
+            train_loss = train_epoch(model, train_loader, optimizer,
+                                     x_grid, grad_weight, device)
             if scheduler:
                 scheduler.step()
             lr = optimizer.param_groups[0]["lr"]
         else:
-            train_loss = train_epoch_lbfgs(model, train_loader, optimizer, x_grid, grad_weight, device)
+            train_loss = train_epoch_lbfgs(model, train_loader, optimizer,
+                                           x_grid, grad_weight, device)
             lr = optimizer.param_groups[0]["lr"]
 
         val_loss = val_epoch(model, val_loader, x_grid, device, epoch, cfg)
@@ -357,7 +388,6 @@ def main(config_path: str):
         epoch_time = time.perf_counter() - epoch_start
         cumulative_time += epoch_time
 
-        # Log to CSV
         _append_stats_csv(stats_csv_path, {
             "epoch":           epoch + 1,
             "train_loss":      f"{train_loss:.6f}",
@@ -375,22 +405,19 @@ def main(config_path: str):
             best_val_loss    = val_loss
             patience_counter = 0
             torch.save(model.state_dict(), save_path)
-            print(f"  -> New best saved ({best_val_loss:.5f})")
+            print(f"  → New best ({best_val_loss:.5f})")
         else:
             patience_counter += 1
             if epoch < adam_epochs and patience_counter >= patience:
-                print(f"Early stopping triggered during Adam phase at epoch {epoch + 1}.")
-                epoch = adam_epochs - 1
-                continue
+                print(f"Early stopping at epoch {epoch + 1}.")
+                break
 
-    # --- Summary ---
     print(f"\nDone. Best val rel-L2: {best_val_loss:.5f}")
     print(f"Total training time : {cumulative_time:.1f}s")
-    print(f"Best model -> {save_path}")
-    print(f"Stats log  -> {stats_csv_path}")
+    print(f"Best model → {save_path}")
 
-    # Generate training curves plot
-    _plot_training_curves(stats_csv_path, f"models/training_curves_{model_tag}.png")
+    _plot_training_curves(stats_csv_path,
+                          f"models/training_curves_{model_tag}.png")
 
 
 if __name__ == "__main__":

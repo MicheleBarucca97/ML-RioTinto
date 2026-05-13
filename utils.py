@@ -48,10 +48,31 @@ def load_x_grid(cfg: dict, device: str) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Auto-detect output dimension M from HDF5
+# ---------------------------------------------------------------------------
+
+def _detect_M_from_h5(cfg: dict) -> int:
+    """Read the output dimension from the HDF5 file.
+
+    For structured-grid benchmarks, M = grid_res ** 3.
+    For Alucell / unstructured data, reads the shape of the training target.
+    """
+    if "grid_res" in cfg["data"]:
+        return cfg["data"]["grid_res"] ** 3
+
+    h5_path = cfg["data"]["h5_path"]
+    with h5py.File(h5_path, "r") as f:
+        # Try meta first (written by prepare_alucell.py)
+        if "meta" in f and "M_out" in f["meta"].attrs:
+            return int(f["meta"].attrs["M_out"])
+        # Fallback: read from training data shape
+        return f["train"]["U"].shape[1]
+
+
+# ---------------------------------------------------------------------------
 # Model factory
 # ---------------------------------------------------------------------------
 
-# Models that do not generalise across benchmarks
 _1D_ONLY = {"CNNDecoder", "DeepSetsCoordinateNet"}
 
 
@@ -61,13 +82,16 @@ def build_model(cfg: dict) -> nn.Module:
     Reads n_params, M, and spatial_dim from the data section of the config
     so there is never a mismatch between dataset dimensions and model dims.
 
+    For Alucell datasets without a structured grid, M is auto-detected
+    from the HDF5 file.
+
     Raises:
         ValueError: for unknown model types or incompatible benchmark/model pairs.
     """
     model_cfg   = cfg["model"]
     model_type  = model_cfg["type"]
     n_params    = cfg["data"]["n_params"]
-    M           = cfg["data"].get("M") or cfg["data"]["grid_res"] ** 3
+    M           = cfg["data"].get("M") or _detect_M_from_h5(cfg)
     spatial_dim = cfg["data"]["spatial_dim"]
     benchmark   = cfg.get("benchmark", "1d")
     grid_res    = cfg["data"].get("grid_res", 15)
