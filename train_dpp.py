@@ -1,31 +1,75 @@
 """
-Training script — works with any benchmark (1-D, 3-D, or Alucell).
+Multi-GPU training script using PyTorch DistributedDataParallel (DDP).
 
-Usage
------
-    python train.py --config config_1d.yaml
-    python train.py --config config_3d.yaml
-    python train.py --config config_alucell.yaml
+Compatible with all benchmarks (1-D, 3-D, and Alucell).
+
+Usage (single node, N GPUs)
+---------------------------
+    torchrun --nproc_per_node=2 train_ddp.py --config config_alucell.yaml
+
+Changes from the single-GPU train.py
+-------------------------------------
+  1. Initialise the distributed process group (NCCL backend).
+  2. Each process binds to its own GPU via local_rank.
+  3. The model is wrapped in DistributedDataParallel.
+  4. DataLoaders use DistributedSampler (shuffled per epoch).
+  5. Only rank 0 saves checkpoints, writes logs, and creates plots.
+  6. The process group is destroyed at exit.
 """
 
 import argparse
 import csv
 import os
+import sys
 import time
+import traceback
 
 import matplotlib
-matplotlib.use("Agg")   # headless-safe; must come before pyplot import
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 import yaml
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from dataset import GaussianDataset
 from utils import build_model, load_x_grid, set_seed, fit_pod_basis_if_needed
+
+
+# ---------------------------------------------------------------------------
+# DDP helpers
+# ---------------------------------------------------------------------------
+
+def setup_ddp():
+    """Initialise the distributed process group.
+
+    torchrun sets RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT.
+    """
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main():
+    return dist.get_rank() == 0
+
+
+def log(msg: str):
+    """Print only on rank 0."""
+    if is_main():
+        print(msg, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -34,12 +78,6 @@ from utils import build_model, load_x_grid, set_seed, fit_pod_basis_if_needed
 
 def sobolev_loss(preds: torch.Tensor, targets: torch.Tensor,
                  grad_weight: float = 0.1) -> torch.Tensor:
-    """MSE on values + weighted MSE on finite-difference gradients.
-
-    The gradient term penalises wrong slopes and helps with sharp features.
-    Set grad_weight=0 to use plain MSE (recommended for 3-D / unstructured /
-    POD coefficient targets).
-    """
     loss = nn.functional.mse_loss(preds, targets)
     if grad_weight > 0:
         slope_pred = preds[:, 1:]   - preds[:, :-1]
@@ -55,8 +93,9 @@ def sobolev_loss(preds: torch.Tensor, targets: torch.Tensor,
 def train_epoch(model, loader, optimizer, x_grid, grad_weight, device):
     model.train()
     total_loss = 0.0
-    for p, u in tqdm(loader, desc="  train", leave=False):
-        p, u = p.to(device), u.to(device)
+    iterator = tqdm(loader, desc="  train", leave=False) if is_main() else loader
+    for p, u in iterator:
+        p, u = p.to(device, non_blocking=True), u.to(device, non_blocking=True)
         optimizer.zero_grad()
         loss = sobolev_loss(model(p, x_grid), u, grad_weight)
         loss.backward()
@@ -64,14 +103,14 @@ def train_epoch(model, loader, optimizer, x_grid, grad_weight, device):
         total_loss += loss.item()
     return total_loss / len(loader)
 
+
 def train_epoch_lbfgs(model, loader, optimizer, x_grid, grad_weight, device):
-    """Specialized training loop for the L-BFGS optimizer."""
     model.train()
     total_loss = 0.0
-    
-    for p, u in tqdm(loader, desc="  train (L-BFGS)", leave=False):
-        p, u = p.to(device), u.to(device)
-        
+    iterator = tqdm(loader, desc="  train (L-BFGS)", leave=False) if is_main() else loader
+    for p, u in iterator:
+        p, u = p.to(device, non_blocking=True), u.to(device, non_blocking=True)
+
         def closure():
             optimizer.zero_grad()
             output = model(p, x_grid)
@@ -79,15 +118,15 @@ def train_epoch_lbfgs(model, loader, optimizer, x_grid, grad_weight, device):
             loss = sobolev_loss(preds, u, grad_weight)
             loss.backward()
             return loss
-            
+
         optimizer.step(closure)
-        
+
         with torch.no_grad():
             output = model(p, x_grid)
             preds = output[0] if isinstance(output, tuple) else output
             loss = sobolev_loss(preds, u, grad_weight)
             total_loss += loss.item()
-            
+
     return total_loss / len(loader)
 
 
@@ -95,37 +134,27 @@ def train_epoch_lbfgs(model, loader, optimizer, x_grid, grad_weight, device):
 def val_epoch(model, loader, x_grid, device, epoch, cfg,
               save_plot_every: int = 5):
     model.eval()
-    total_rmse = 0.0
-    total_r2 = 0.0
+    total_rel_l2 = 0.0
     benchmark = cfg.get("benchmark", "1d")
 
     for batch_idx, (p, u) in enumerate(loader):
-        p, u = p.to(device), u.to(device)
+        p, u = p.to(device, non_blocking=True), u.to(device, non_blocking=True)
         preds = model(p, x_grid)
-        
-        # 1. RMSE (Stable Absolute Error)
-        mse = torch.mean((preds - u) ** 2, dim=1)
-        rmse = torch.sqrt(mse).mean().item()
-        
-        # 2. R^2 Score (Explained Variance)
-        ss_res = torch.sum((u - preds) ** 2, dim=1)
-        ss_tot = torch.sum((u - u.mean(dim=1, keepdim=True)) ** 2, dim=1)
-        r2 = (1.0 - ss_res / (ss_tot + 1e-12)).mean().item()
+        rel_l2 = (
+            torch.norm(preds - u, dim=1) /
+            (torch.norm(u, dim=1) + 1e-6)
+        ).mean()
+        total_rel_l2 += rel_l2.item()
 
-        total_rmse += rmse
-        total_r2 += r2
-
-        if batch_idx == 0 and epoch % save_plot_every == 0:
-            # We can pass rmse to the plot function instead of rel_l2
-            _save_val_plot(x_grid, u[0], preds[0], rmse,
+        if batch_idx == 0 and epoch % save_plot_every == 0 and is_main():
+            _save_val_plot(x_grid, u[0], preds[0], rel_l2.item(),
                            epoch, benchmark, cfg)
 
-    num_batches = len(loader)
-    return total_rmse / num_batches, total_r2 / num_batches
+    return total_rel_l2 / len(loader)
 
 
 # ---------------------------------------------------------------------------
-# Validation plotting
+# Plotting helpers (rank 0 only)
 # ---------------------------------------------------------------------------
 
 def _save_val_plot(x_grid, u, pred, rel_l2, epoch, benchmark, cfg):
@@ -141,23 +170,24 @@ def _save_val_plot(x_grid, u, pred, rel_l2, epoch, benchmark, cfg):
 
 
 def _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path):
-    """Validation plot for Alucell: contour on mid-ACD plane or interface."""
+    """Validation plot for Alucell: contour on mid-ACD plane or bar chart
+    for POD coefficients."""
     coords = x_grid.cpu().numpy()
     M_grid = coords.shape[0]
     u_np   = u.cpu().numpy()
     pred_np = pred.cpu().numpy()
 
-    # Vector field (M×3 → magnitude) vs scalar
+    # Vector field (M×3 → magnitude) vs scalar vs POD coefficients
     if u_np.shape[0] == M_grid * 3:
         field_true = np.linalg.norm(u_np.reshape(M_grid, 3), axis=1)
         field_pred = np.linalg.norm(pred_np.reshape(M_grid, 3), axis=1)
-        label = "|Δu| (m/s)" if "delta" in path.lower() else "|u| (m/s)"
+        label = "|u| (m/s)"
     elif u_np.shape[0] == M_grid:
         field_true = u_np
         field_pred = pred_np
         label = "field"
     else:
-        # POD coefficients — bar chart instead of contour
+        # POD coefficients — bar chart
         fig, ax = plt.subplots(figsize=(10, 4))
         k = len(u_np)
         x = np.arange(k)
@@ -227,23 +257,23 @@ def _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path):
 
 
 # ---------------------------------------------------------------------------
-# Training statistics
+# Training statistics (rank 0 only)
 # ---------------------------------------------------------------------------
 
 def _init_stats_csv(path: str):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_rmse", "lr",
+        writer.writerow(["epoch", "train_loss", "val_rel_l2", "lr",
                           "epoch_time_s", "cumulative_time_s"])
 
 
 def _append_stats_csv(path: str, row: dict):
     with open(path, "a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([row["epoch"], row["train_loss"], row["val_rmse"], row["lr"],
-                          row["epoch_time_s"], row["cumulative_time_s"]])
-
+        writer.writerow([row["epoch"], row["train_loss"], row["val_rel_l2"],
+                          row["lr"], row["epoch_time_s"],
+                          row["cumulative_time_s"]])
 
 
 def _plot_training_curves(stats_path: str, out_path: str):
@@ -297,47 +327,72 @@ def _plot_training_curves(stats_path: str, out_path: str):
 # ---------------------------------------------------------------------------
 
 def main(config_path: str):
+    # ── 1. Initialise DDP ──
+    local_rank = setup_ddp()
+    rank       = dist.get_rank()
+    world_size = dist.get_world_size()
+    device     = f"cuda:{local_rank}"
+
+    log(f"DDP initialised: {world_size} processes")
+
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
     set_seed(cfg["seed"])
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    benchmark = cfg.get("benchmark", "1d")
-    print(f"Benchmark : {benchmark}")
-    print(f"Device    : {device}")
 
-    # --- Data ---
-    h5_path    = cfg["data"]["h5_path"]
-    train_cfg  = cfg["training"]
+    benchmark = cfg.get("benchmark", "1d")
+    log(f"Benchmark  : {benchmark}")
+    log(f"World size : {world_size} GPUs")
+
+    # ── 2. Data ──
+    h5_path   = cfg["data"]["h5_path"]
+    train_cfg = cfg["training"]
 
     train_ds = GaussianDataset(h5_path, split="train")
     val_ds   = GaussianDataset(h5_path, split="val")
 
     if cfg["data"].get("use_subset", False):
-        n_sub    = cfg["data"].get("subset_size", cfg["data"]["samples"]["train"])
-        rng      = np.random.default_rng(cfg["seed"])
-        indices  = rng.permutation(len(train_ds))[:n_sub]
+        n_sub   = cfg["data"].get("subset_size", cfg["data"]["samples"]["train"])
+        rng     = np.random.default_rng(cfg["seed"])
+        indices = rng.permutation(len(train_ds))[:n_sub]
         train_ds = Subset(train_ds, indices)
-        print(f"Subset    : {n_sub} training samples")
+        log(f"Subset     : {n_sub} training samples")
     else:
-        print(f"Train set : {len(train_ds)} samples")
+        log(f"Train set  : {len(train_ds)} samples")
 
-    num_workers = train_cfg.get("num_workers", 4)
+    # DistributedSampler splits data across GPUs
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size,
+                                       rank=rank, shuffle=True)
+    val_sampler   = DistributedSampler(val_ds, num_replicas=world_size,
+                                       rank=rank, shuffle=False)
+
+    num_workers  = train_cfg.get("num_workers", 4)
     train_loader = DataLoader(train_ds, batch_size=train_cfg["batch_size"],
-                              shuffle=True, num_workers=num_workers,
-                              pin_memory=(device == "cuda"))
-    val_loader   = DataLoader(val_ds,   batch_size=train_cfg["batch_size"],
-                              shuffle=False, num_workers=num_workers)
+                              sampler=train_sampler,
+                              num_workers=num_workers,
+                              pin_memory=True,
+                              drop_last=True)
+    val_loader   = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
+                              sampler=val_sampler,
+                              num_workers=num_workers,
+                              pin_memory=True)
 
     x_grid = load_x_grid(cfg, device)
-    print(f"x_grid    : {tuple(x_grid.shape)}")
+    log(f"x_grid     : {tuple(x_grid.shape)}")
 
-    # --- Model ---
-    model    = build_model(cfg).to(device)
+    # ── 3. Model → DDP ──
+    model = build_model(cfg).to(device)
+
+    # POD basis fitting must happen BEFORE wrapping in DDP
+    fit_pod_basis_if_needed(model, train_ds, device)
+
+    model = DDP(model, device_ids=[local_rank],
+                find_unused_parameters=False)
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model     : {cfg['model']['type']}  ({n_params:,} parameters)")
+    log(f"Model      : {cfg['model']['type']}  ({n_params:,} parameters)")
 
-    # --- Optimizer & scheduler ---
+    # ── 4. Optimizer & scheduler ──
     optimizer = optim.AdamW(model.parameters(),
                             lr=float(train_cfg["lr"]),
                             weight_decay=float(train_cfg["weight_decay"]))
@@ -345,16 +400,16 @@ def main(config_path: str):
         optimizer, T_max=train_cfg["epochs"], eta_min=1e-6
     )
 
-    # --- POD basis fitting (no-op for all models except POD_MLP) ---
-    fit_pod_basis_if_needed(model, train_ds, device)
-
-    # --- Training loop ---
+    # ── 5. Training loop ──
     grad_weight      = train_cfg.get("grad_loss_weight", 0.1)
     patience         = train_cfg.get("patience", 30)
     best_val_loss    = float("inf")
     patience_counter = 0
 
-    os.makedirs("models", exist_ok=True)
+    if is_main():
+        os.makedirs("models", exist_ok=True)
+    dist.barrier()
+
     model_tag  = cfg["model"]["type"]
     save_path  = f"models/best_model_{model_tag}.pth"
 
@@ -363,20 +418,22 @@ def main(config_path: str):
     adam_epochs  = total_epochs - lbfgs_epochs
 
     stats_csv_path = f"models/training_stats_{model_tag}.csv"
-    _init_stats_csv(stats_csv_path)
+    if is_main():
+        _init_stats_csv(stats_csv_path)
     cumulative_time = 0.0
 
-    print(f"\nTraining for up to {total_epochs} epochs…")
-    print(f"  Phase 1: AdamW for {adam_epochs} epochs")
-    if lbfgs_epochs:
-        print(f"  Phase 2: L-BFGS for {lbfgs_epochs} epochs")
-    print()
+    log(f"\nTraining for up to {total_epochs} epochs…")
+    log(f"  Effective batch size: {train_cfg['batch_size']} × {world_size} = "
+        f"{train_cfg['batch_size'] * world_size}\n")
 
     for epoch in range(total_epochs):
         epoch_start = time.perf_counter()
 
+        # Tell the sampler which epoch for proper shuffling
+        train_sampler.set_epoch(epoch)
+
         if epoch == adam_epochs and lbfgs_epochs > 0:
-            print("\n>>> Switching to L-BFGS…\n")
+            log("\n>>> Switching to L-BFGS…\n")
             optimizer = optim.LBFGS(
                 model.parameters(), lr=0.01, max_iter=20,
                 history_size=50, line_search_fn="strong_wolfe")
@@ -393,45 +450,64 @@ def main(config_path: str):
                                            x_grid, grad_weight, device)
             lr = optimizer.param_groups[0]["lr"]
 
-        val_rmse, val_r2 = val_epoch(model, val_loader, x_grid, device, epoch, cfg)
+        val_loss = val_epoch(model, val_loader, x_grid, device, epoch, cfg)
+
+        # ── Sync val_loss across ranks ──
+        val_tensor = torch.tensor(val_loss, device=device)
+        dist.all_reduce(val_tensor, op=dist.ReduceOp.AVG)
+        val_loss = val_tensor.item()
 
         epoch_time = time.perf_counter() - epoch_start
         cumulative_time += epoch_time
 
-        _append_stats_csv(stats_csv_path, {
-            "epoch":           epoch + 1,
-            "train_loss":      f"{train_loss:.6f}",
-            "val_rel_l2":      f"{val_rmse:.6e}", # Re-using CSV column for RMSE
-            "lr":              f"{lr:.2e}",
-            "epoch_time_s":    f"{epoch_time:.2f}",
-            "cumulative_time_s": f"{cumulative_time:.2f}",
-        })
+        log(f"Epoch {epoch + 1:4d}  "
+            f"train={train_loss:.5f}  val_rel_l2={val_loss:.5f}  "
+            f"lr={lr:.2e}  time={epoch_time:.1f}s")
 
-        print(f"Epoch {epoch + 1:4d}  "
-              f"train={train_loss:.5f}  val_rmse={val_rmse:.5e}  val_R2={val_r2:.4f}  "
-              f"lr={lr:.2e}  time={epoch_time:.1f}s")
+        if is_main():
+            _append_stats_csv(stats_csv_path, {
+                "epoch":           epoch + 1,
+                "train_loss":      f"{train_loss:.6f}",
+                "val_rel_l2":      f"{val_loss:.6f}",
+                "lr":              f"{lr:.2e}",
+                "epoch_time_s":    f"{epoch_time:.2f}",
+                "cumulative_time_s": f"{cumulative_time:.2f}",
+            })
 
-        if val_rmse < best_val_loss:
-            best_val_loss    = val_rmse
+        if val_loss < best_val_loss:
+            best_val_loss    = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), save_path)
-            print(f"  → New best ({best_val_loss:.5f})")
+            if is_main():
+                # Save the underlying model, not the DDP wrapper
+                torch.save(model.module.state_dict(), save_path)
+                log(f"  → New best ({best_val_loss:.5f})")
         else:
             patience_counter += 1
             if epoch < adam_epochs and patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch + 1}.")
+                log(f"Early stopping at epoch {epoch + 1}.")
                 break
 
-    print(f"\nDone. Best val rel-L2: {best_val_loss:.5f}")
-    print(f"Total training time : {cumulative_time:.1f}s")
-    print(f"Best model → {save_path}")
+    # ── 6. Wrap up ──
+    log(f"\nDone. Best val rel-L2: {best_val_loss:.5f}")
+    log(f"Total training time : {cumulative_time:.1f}s")
+    log(f"Best model → {save_path}")
 
-    _plot_training_curves(stats_csv_path,
-                          f"models/training_curves_{model_tag}.png")
+    if is_main():
+        _plot_training_curves(stats_csv_path,
+                              f"models/training_curves_{model_tag}.png")
+
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
-    main(args.config)
+
+    try:
+        main(args.config)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        print(traceback.format_exc(), flush=True)
+        cleanup_ddp()
+        sys.exit(1)

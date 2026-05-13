@@ -52,25 +52,36 @@ def run_inference(model, loader, x_grid, device):
 # ---------------------------------------------------------------------------
 
 def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> dict:
-    rmse   = np.sqrt(np.mean((preds - targets) ** 2, axis=1))
+    # 1. Root Mean Square Error (Absolute physical magnitude)
+    rmse = np.sqrt(np.mean((preds - targets) ** 2, axis=1))
+    
+    # 2. Relative L2 Norm
     rel_l2 = (
         np.linalg.norm(preds - targets, axis=1) /
         (np.linalg.norm(targets, axis=1) + 1e-12)
     )
-    return {"rmse": rmse, "rel_l2": rel_l2,
-            "rmse_mean":   rmse.mean(),   "rmse_std":   rmse.std(),
-            "rel_l2_mean": rel_l2.mean(), "rel_l2_std": rel_l2.std()}
+    
+    # 3. Explained Variance (R^2 Score)
+    ss_res = np.sum((targets - preds) ** 2, axis=1)
+    ss_tot = np.sum((targets - np.mean(targets, axis=1, keepdims=True)) ** 2, axis=1)
+    r2 = 1.0 - (ss_res / (ss_tot + 1e-12))
 
+    return {
+        "rmse": rmse, "rel_l2": rel_l2, "r2": r2,
+        "rmse_mean":   rmse.mean(),   "rmse_std":   rmse.std(),
+        "rel_l2_mean": rel_l2.mean(), "rel_l2_std": rel_l2.std(),
+        "r2_mean":     r2.mean(),     "r2_std":     r2.std()
+    }
 
 def print_metrics(metrics: dict, n_samples: int, label: str = ""):
     tag = f" ({label})" if label else ""
-    print("=" * 60)
+    print("=" * 65)
     print(f"Test results{tag} — {n_samples} samples")
-    print(f"  Mean RMSE    : {metrics['rmse_mean']:.6f} ± {metrics['rmse_std']:.6f}")
-    print(f"  Mean Rel-L2  : {metrics['rel_l2_mean']:.6f} ± {metrics['rel_l2_std']:.6f}")
-    print(f"  Median Rel-L2: {np.median(metrics['rel_l2']):.6f}")
-    print(f"  Max Rel-L2   : {metrics['rel_l2'].max():.6f}")
-    print("=" * 60)
+    print(f"  Mean R^2 Score: {metrics['r2_mean']:.4f} ± {metrics['r2_std']:.4f}")
+    print(f"  Mean RMSE     : {metrics['rmse_mean']:.6e} ± {metrics['rmse_std']:.6e}")
+    print(f"  Mean Rel-L2   : {metrics['rel_l2_mean']:.6f} ± {metrics['rel_l2_std']:.6f}")
+    print(f"  Max Rel-L2    : {metrics['rel_l2'].max():.6f}")
+    print("=" * 65)
 
 
 def print_per_mode_metrics(metrics: dict, modes: list[str]):
