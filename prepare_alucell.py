@@ -44,20 +44,17 @@ Delta-learning  (--delta)
 Usage examples
 --------------
   # Mid-ACD velocity, delta, let POD_MLP handle reduction
-  python prepare_alucell.py \\
-      --master runs/master_dataset.h5 --manifest runs/manifest.csv \\
-      --mapping velocity_midacd --delta \\
-      --output data/midacd_delta.h5
+  python prepare_alucell.py --master ../ml_alu_data/master_dataset.h5 --manifest ../ml_alu_data/manifest.csv --mapping velocity_midacd --delta --output data/midacd_delta.h5
 
   # Full 3D velocity, delta + offline POD → small coefficient target
   python prepare_alucell.py \\
-      --master runs/master_dataset.h5 --manifest runs/manifest.csv \\
+      --master ml_alu_data/master_dataset.h5 --manifest ml_alu_data/manifest.csv \\
       --mapping velocity_full --delta --pod --n-modes 50 \\
       --output data/full3d_pod_delta.h5
 
   # Interface, delta, no POD (POD_MLP at training time)
   python prepare_alucell.py \\
-      --master runs/master_dataset.h5 --manifest runs/manifest.csv \\
+      --master ml_alu_data/master_dataset.h5 --manifest ml_alu_data/manifest.csv \\
       --mapping interface --delta \\
       --output data/interface_delta.h5
 
@@ -140,7 +137,11 @@ def _check_consistent_grid(master, run_names, grid_path):
     ref = master[run_names[0]][grid_path][:].astype(np.float64)
     for name in run_names[1:min(6, len(run_names))]:
         other = master[name][grid_path][:].astype(np.float64)
-        if other.shape != ref.shape or not np.allclose(other, ref, atol=1e-6):
+        
+        # Only check X and Y coordinates ([:, :2]) for strict consistency.
+        # The Z coordinate fluctuates slightly due to the conformal mapping 
+        # to the interface and the ALE volume conservation constraint.
+        if other.shape != ref.shape or not np.allclose(other[:, :2], ref[:, :2], atol=1e-5):
             return ref, False
     return ref, True
 
@@ -188,48 +189,92 @@ def extract_velocity_midacd(master, run_names, ref_name, do_delta, **kw):
 
 
 def extract_velocity_full(master, run_names, ref_name, do_delta, **kw):
-    """Extract the full 3D velocity field.
-
-    The ALE mesh deforms slightly per run, but the topology (number of
-    nodes, connectivity) is preserved.  Since the deformations are small
-    (~10 mm on a ~1 m cell), we treat the DOF vectors as living in the
-    same space.  This is the same approximation used in the coverage
-    analysis (field POD on fields_full/vitesse).
+    """Extract the 3D velocity field on FLUID nodes only (bath + aluminium).
+ 
+    The cuveb mesh contains the entire cell (solids + fluids). We use
+    cuveb_refs and the material IDs ref_alu / ref_ele (stored by
+    ml_export.cpp in /scalars) to restrict to fluid elements, then
+    collect the unique node set.
+ 
+    This avoids training on trivially-zero solid-domain DOFs and makes
+    the POD significantly more efficient.
     """
     field_path = "fields_full/vitesse"
     grid_path  = "mesh/cuveb_nodes"
-
-    # Reference grid (for visualisation only)
-    x_grid_ref = master[run_names[0]][grid_path][:].astype(np.float32)
-
-    first = master[run_names[0]][field_path][()].astype(np.float32)
-    M_nodes = first.shape[0]
-    n_comp  = first.shape[1] if first.ndim > 1 else 1
-    field_shape = (M_nodes, n_comp)
-    M_field = M_nodes * n_comp
+    elem_path  = "mesh/cuveb_elems"
+    refs_path  = "mesh/cuveb_refs"
+ 
+    # ── Identify fluid nodes from the first run ──
+    grp0 = master[run_names[0]]
+ 
+    # Material reference IDs
+    scalars = grp0["scalars"]
+    ref_ele = int(scalars.attrs["ref_ele"])   # bath / electrolyte
+    ref_alu = int(scalars.attrs["ref_alu"])   # liquid aluminium
+ 
+    elems = grp0[elem_path][:].astype(np.int32)   # (Ne, 4) 0-indexed
+    refs  = grp0[refs_path][:].ravel()
+ 
+    fluid_elem_mask = (refs == ref_ele) | (refs == ref_alu)
+    fluid_node_ids  = np.unique(elems[fluid_elem_mask].ravel())  # sorted
+    fluid_node_ids  = fluid_node_ids.astype(np.int32)
+ 
+    M_total = grp0[grid_path].shape[0]
+    M_fluid = len(fluid_node_ids)
+    n_comp  = 3
+    field_shape = (M_fluid, n_comp)
+    M_field = M_fluid * n_comp
     N = len(run_names)
-
-    print(f"  Loading {N} full-field snapshots ({M_field} DOFs)…")
+ 
+    print(f"  Fluid-node filter: {M_fluid} / {M_total} nodes "
+          f"({100 * M_fluid / M_total:.1f}% of cuveb mesh)")
+    print(f"  Material refs: bath={ref_ele}, aluminium={ref_alu}")
+    print(f"  Loading {N} fluid-only snapshots ({M_field} DOFs)…")
+ 
+    # Reference grid: fluid nodes only
+    x_grid_ref = grp0[grid_path][:].astype(np.float32)[fluid_node_ids]
+ 
     P = np.empty((N, N_ANODES), dtype=np.float32)
     U = np.empty((N, M_field),  dtype=np.float32)
-
+ 
     for i, name in enumerate(run_names):
         grp = master[name]
         P[i] = grp["input/currents"][:].astype(np.float32).ravel()[:N_ANODES]
-        U[i] = grp[field_path][()].astype(np.float32).ravel()
-
+        vel  = grp[field_path][()].astype(np.float32)   # (M_total, 3)
+        U[i] = vel[fluid_node_ids].ravel()               # (M_fluid * 3,)
+ 
     u_ref = None
     if do_delta:
-        u_ref = master[ref_name][field_path][()].astype(np.float32).ravel()
+        vel_ref = master[ref_name][field_path][()].astype(np.float32)
+        u_ref = vel_ref[fluid_node_ids].ravel()
         U -= u_ref[None, :]
-
-    print(f"  velocity_full: P{P.shape}, U{U.shape}")
+ 
+    print(f"  velocity_full (fluid only): P{P.shape}, U{U.shape}, "
+          f"grid{x_grid_ref.shape}")
+ 
+    # Pack fluid_node_ids into kw so write_h5 can store it.
+    # We piggyback on the **kw mechanism or return it via a side channel.
+    # Cleanest: store in a module-level variable that write_h5 reads.
+    extract_velocity_full._fluid_node_ids = fluid_node_ids
+    extract_velocity_full._M_total = M_total
+ 
+    # Also store the fluid element connectivity for proper mesh plotting
+    # Remap element node IDs: old_global → new_local
+    global_to_local = np.full(M_total, -1, dtype=np.int32)
+    global_to_local[fluid_node_ids] = np.arange(M_fluid, dtype=np.int32)
+    fluid_elems_global = elems[fluid_elem_mask]          # (Ne_fluid, 4)
+    fluid_elems_local  = global_to_local[fluid_elems_global]
+    fluid_refs = refs[fluid_elem_mask]
+ 
+    extract_velocity_full._fluid_elems = fluid_elems_local
+    extract_velocity_full._fluid_refs  = fluid_refs
+ 
     return P, U, x_grid_ref, u_ref, field_shape
 
 
 def extract_interface(master, run_names, ref_name, do_delta,
                       grid_res=64, **kw):
-    field_path    = "fields_interface/h"
+    # We no longer need field_path = "fields_interface/h"
     int_node_path = "mesh/interface_nodes"
 
     # Bounding box
@@ -252,12 +297,12 @@ def extract_interface(master, run_names, ref_name, do_delta,
     x_grid = xy_target.astype(np.float32)
     field_shape = (M, 1)
 
-    def _interp(nodes_2d, h_vals, xy):
-        h = griddata(nodes_2d, h_vals, xy, method='linear')
-        nans = np.isnan(h)
+    def _interp(nodes_2d, target_vals, xy):
+        val = griddata(nodes_2d, target_vals, xy, method='linear')
+        nans = np.isnan(val)
         if nans.any():
-            h[nans] = griddata(nodes_2d, h_vals, xy[nans], method='nearest')
-        return h
+            val[nans] = griddata(nodes_2d, target_vals, xy[nans], method='nearest')
+        return val
 
     N = len(run_names)
     P = np.empty((N, N_ANODES), dtype=np.float32)
@@ -265,12 +310,15 @@ def extract_interface(master, run_names, ref_name, do_delta,
     valid = 0
     for name in run_names:
         grp = master[name]
-        if field_path not in grp or int_node_path not in grp:
+        if int_node_path not in grp:
             continue
         nodes  = grp[int_node_path][:].astype(np.float64)
-        h_vals = grp[field_path][:].astype(np.float64).ravel()
+        
+        # THE FIX: Extract the absolute Z coordinate of the interface mesh
+        z_vals = nodes[:, 2]
+        
         P[valid] = grp["input/currents"][:].astype(np.float32).ravel()[:N_ANODES]
-        U[valid] = _interp(nodes[:, :2], h_vals, xy_target).astype(np.float32)
+        U[valid] = _interp(nodes[:, :2], z_vals, xy_target).astype(np.float32)
         valid += 1
     P, U = P[:valid], U[:valid]
 
@@ -278,8 +326,12 @@ def extract_interface(master, run_names, ref_name, do_delta,
     if do_delta:
         rg = master[ref_name]
         ref_nodes = rg[int_node_path][:].astype(np.float64)
-        ref_h     = rg[field_path][:].astype(np.float64).ravel()
-        u_ref = _interp(ref_nodes[:, :2], ref_h, xy_target).astype(np.float32)
+        
+        # Extract the absolute Z coordinate of the REFERENCE run
+        ref_z = ref_nodes[:, 2]
+        u_ref = _interp(ref_nodes[:, :2], ref_z, xy_target).astype(np.float32)
+        
+        # U -= u_ref now naturally computes the total cumulative physical \Delta Z
         U -= u_ref[None, :]
 
     print(f"  interface: P{P.shape}, U{U.shape}, grid{x_grid.shape}")
@@ -453,6 +505,30 @@ def stratified_split(N, run_names, ratios, manifest_path=None,
     return np.sort(train_all), np.sort(val_all), np.sort(test_all), modes
 
 
+def _write_fluid_mesh_info(recon_group):
+    """Call this inside write_h5 after creating the reconstruction/ group.
+ 
+    Stores the fluid-node index array and mesh connectivity so that
+    evaluation/plotting can map predicted DOFs back to the full mesh.
+    """
+    fluid_node_ids = getattr(extract_velocity_full, '_fluid_node_ids', None)
+    M_total        = getattr(extract_velocity_full, '_M_total', None)
+    fluid_elems    = getattr(extract_velocity_full, '_fluid_elems', None)
+    fluid_refs     = getattr(extract_velocity_full, '_fluid_refs', None)
+ 
+    if fluid_node_ids is not None:
+        recon_group.create_dataset("fluid_node_ids", data=fluid_node_ids)
+        recon_group.attrs["M_total"] = M_total
+        print(f"  Stored fluid_node_ids ({len(fluid_node_ids)}) and "
+              f"M_total={M_total}")
+ 
+    if fluid_elems is not None:
+        recon_group.create_dataset("fluid_elems", data=fluid_elems,
+                                   compression="gzip")
+        recon_group.create_dataset("fluid_refs", data=fluid_refs)
+        print(f"  Stored fluid mesh: {fluid_elems.shape[0]} tets")
+
+
 # ======================================================================
 # HDF5 writer
 # ======================================================================
@@ -488,6 +564,7 @@ def write_h5(path, P, U, x_grid, train_idx, val_idx, test_idx,
         s.create_dataset("u_std",  data=u_std)
 
         r = f.create_group("reconstruction")
+        _write_fluid_mesh_info(r)
         if u_ref is not None:
             r.create_dataset("u_ref", data=u_ref, compression="gzip")
         if pod_info is not None:

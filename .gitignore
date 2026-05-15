@@ -14,6 +14,9 @@ env/
 data/
 models/
 plots/
+alu_data/
+logs/
+*.run
 *.pth
 *.h5
 *.ckpt

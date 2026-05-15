@@ -53,10 +53,10 @@ seed: 42
 # Data — dimensions are auto-detected from the HDF5 at runtime
 # --------------------------------------------------------------------------
 data:
-  h5_path: "./data/midacd_delta.h5"
+  h5_path: "./data/full3d_pod_delta.h5"  # Change to your prepared dataset
 
   n_params: 24            # 24 anodes
-  spatial_dim: 2          # mid-ACD / interface are 2D planes
+  spatial_dim: 3         # dimension of the grid (2 for mid-ACD plane, 3 for full 3D)
   # M_out is read from the HDF5 automatically
 
   use_subset: no
@@ -79,7 +79,7 @@ training:
 # Model
 # --------------------------------------------------------------------------
 model:
-  type: "POD_MLP"         # Change to "ResFFNN" when using --pod data
+  type: "ResFFNN"   # Change to "ResFFNN" when using --pod data
   hidden_dim: 256
   num_blocks: 4
   n_modes: 40              # Only used by POD_MLP

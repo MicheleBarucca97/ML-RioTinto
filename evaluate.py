@@ -32,6 +32,8 @@ from dataset import (
 )
 from utils import build_model, load_x_grid
 
+from plot_alucell_3d import plot_alucell_3d
+
 
 # ---------------------------------------------------------------------------
 # Inference
@@ -108,7 +110,7 @@ def print_per_mode_metrics(metrics: dict, modes: list[str]):
 # Plots — Alucell
 # ---------------------------------------------------------------------------
 
-def _plot_alucell(preds, targets, x_grid, metrics, indices, cfg, recon_preds=None):
+def _plot_alucell(preds, targets, x_grid, metrics, indices, cfg, recon_preds=None, recon_targets=None):
     """Plot results on mid-ACD plane or interface.
 
     When recon_preds is not None (delta/POD case), plots the reconstructed
@@ -119,8 +121,7 @@ def _plot_alucell(preds, targets, x_grid, metrics, indices, cfg, recon_preds=Non
 
     # Decide what to plot: reconstructed field if available, else raw
     plot_preds   = recon_preds if recon_preds is not None else preds
-    plot_targets = targets   # always raw targets in model space; we may
-                             # need to reconstruct targets too for fair comparison
+    plot_targets = recon_targets if recon_targets is not None else targets
 
     # Detect field type
     M_out = plot_preds.shape[1]
@@ -274,15 +275,20 @@ def _plot_3d(preds, targets, x_grid, metrics, indices, cfg):
 # ---------------------------------------------------------------------------
 
 def plot_results(preds, targets, x_grid, metrics, cfg,
-                 n_plots=5, seed=0, recon_preds=None):
+                 n_plots=5, seed=0, recon_preds=None, recon_targets=None):
     benchmark = cfg.get("benchmark", "1d")
     rng       = np.random.default_rng(seed)
     indices   = rng.choice(len(preds), size=min(n_plots, len(preds)),
                            replace=False)
 
     if benchmark == "alucell":
-        _plot_alucell(preds, targets, x_grid, metrics, indices, cfg,
-                      recon_preds=recon_preds)
+        spatial_dim = cfg["data"].get("spatial_dim", 2)
+        if spatial_dim == 3 and recon_preds is not None:
+            plot_alucell_3d(preds, targets, x_grid, metrics, indices, cfg,
+                            recon_preds=recon_preds, recon_targets=recon_targets)
+        else:
+            _plot_alucell(preds, targets, x_grid, metrics, indices, cfg,
+                          recon_preds=recon_preds, recon_targets=recon_targets)
     elif benchmark == "1d":
         _plot_1d(preds, targets, x_grid, metrics, indices)
     else:
@@ -355,8 +361,12 @@ def evaluate(config_path: str, model_path: str | None = None, n_plots: int = 5):
         report_metrics = metrics_raw
 
     # --- Plots ---
-    plot_results(preds, targets, x_grid, report_metrics, cfg,
-                 n_plots=n_plots, recon_preds=recon_preds)
+    if needs_recon:
+        plot_results(preds, targets, x_grid, report_metrics, cfg,
+                     n_plots=n_plots, recon_preds=recon_preds, recon_targets=recon_targets)
+    else:
+        plot_results(preds, targets, x_grid, report_metrics, cfg,
+                     n_plots=n_plots)
 
 
 if __name__ == "__main__":

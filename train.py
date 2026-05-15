@@ -247,13 +247,13 @@ def _append_stats_csv(path: str, row: dict):
 
 
 def _plot_training_curves(stats_path: str, out_path: str):
-    epochs, train_loss, val_rel_l2, lr, epoch_time = [], [], [], [], []
+    epochs, train_loss, val_rmse, lr, epoch_time = [], [], [], [], []
     with open(stats_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
             epochs.append(int(row["epoch"]))
             train_loss.append(float(row["train_loss"]))
-            val_rel_l2.append(float(row["val_rel_l2"]))
+            val_rmse.append(float(row["val_rmse"]))
             lr.append(float(row["lr"]))
             epoch_time.append(float(row["epoch_time_s"]))
 
@@ -266,12 +266,12 @@ def _plot_training_curves(stats_path: str, out_path: str):
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].set_title("Train Loss")
 
-    axes[0, 1].plot(epochs, val_rel_l2, color="tomato", lw=1.5)
-    axes[0, 1].set_ylabel("Val Rel-L2")
+    axes[0, 1].plot(epochs, val_rmse, color="tomato", lw=1.5)
+    axes[0, 1].set_ylabel("Val RMSE")
     axes[0, 1].set_xlabel("Epoch")
     axes[0, 1].set_yscale("log")
     axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].set_title("Validation Rel-L2")
+    axes[0, 1].set_title("Validation RMSE")
 
     axes[1, 0].plot(epochs, lr, color="seagreen", lw=1.5)
     axes[1, 0].set_ylabel("Learning Rate")
@@ -401,7 +401,7 @@ def main(config_path: str):
         _append_stats_csv(stats_csv_path, {
             "epoch":           epoch + 1,
             "train_loss":      f"{train_loss:.6f}",
-            "val_rel_l2":      f"{val_rmse:.6e}", # Re-using CSV column for RMSE
+            "val_rmse":      f"{val_rmse:.6e}", # Re-using CSV column for RMSE
             "lr":              f"{lr:.2e}",
             "epoch_time_s":    f"{epoch_time:.2f}",
             "cumulative_time_s": f"{cumulative_time:.2f}",
