@@ -39,7 +39,12 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from dataset import GaussianDataset
-from utils import build_model, load_x_grid, set_seed, fit_pod_basis_if_needed
+from utils import (
+    METRIC_LABELS, batch_val_metrics, build_model, fit_pod_basis_if_needed,
+    is_better_metric, load_x_grid, plot_dir, run_tag,
+    select_val_metric, set_seed,
+    worst_metric_value,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -131,45 +136,56 @@ def train_epoch_lbfgs(model, loader, optimizer, x_grid, grad_weight, device):
 
 
 @torch.no_grad()
-def val_epoch(model, loader, x_grid, device, epoch, cfg,
+def val_epoch(model, loader, x_grid, device, epoch, cfg, monitored,
               save_plot_every: int = 5):
+    """Mean RMSE, rel-L2 and R^2 over the FULL validation split.
+
+    Each rank only sees its own DistributedSampler shard, so per-sample sums
+    and the sample count are all-reduced with SUM and divided once — averaging
+    per-rank means would be wrong whenever the shards differ in size.
+    """
     model.eval()
-    total_rel_l2 = 0.0
     benchmark = cfg.get("benchmark", "1d")
+    totals, n_seen = None, 0.0
 
     for batch_idx, (p, u) in enumerate(loader):
         p, u = p.to(device, non_blocking=True), u.to(device, non_blocking=True)
         preds = model(p, x_grid)
-        rel_l2 = (
-            torch.norm(preds - u, dim=1) /
-            (torch.norm(u, dim=1) + 1e-6)
-        ).mean()
-        total_rel_l2 += rel_l2.item()
+
+        sums = batch_val_metrics(preds, u)
+        n_seen += sums.pop("n")
+        totals = sums if totals is None else {k: totals[k] + v
+                                              for k, v in sums.items()}
 
         if batch_idx == 0 and epoch % save_plot_every == 0 and is_main():
-            _save_val_plot(x_grid, u[0], preds[0], rel_l2.item(),
+            first = batch_val_metrics(preds[:1], u[:1])
+            _save_val_plot(x_grid, u[0], preds[0], first[monitored], monitored,
                            epoch, benchmark, cfg)
 
-    return total_rel_l2 / len(loader)
+    keys = ["rmse", "rel_l2", "r2"]
+    packed = torch.tensor([totals[k] for k in keys] + [n_seen], device=device)
+    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    n_total = packed[-1].item()
+    return {k: (packed[i] / n_total).item() for i, k in enumerate(keys)}
 
 
 # ---------------------------------------------------------------------------
 # Plotting helpers (rank 0 only)
 # ---------------------------------------------------------------------------
 
-def _save_val_plot(x_grid, u, pred, rel_l2, epoch, benchmark, cfg):
-    os.makedirs("plots", exist_ok=True)
-    path = f"plots/val_epoch_{epoch + 1:04d}.png"
+def _save_val_plot(x_grid, u, pred, score, monitored, epoch, benchmark, cfg):
+    path = os.path.join(plot_dir(cfg), f"val_epoch_{epoch + 1:04d}.png")
+    label = f"{METRIC_LABELS[monitored]} = {score:.4g}"
 
     if benchmark == "alucell":
-        _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path)
+        _plot_alucell_val(x_grid, u, pred, label, epoch, path)
     elif benchmark == "1d":
-        _plot_1d_val(x_grid, u, pred, rel_l2, epoch, path)
+        _plot_1d_val(x_grid, u, pred, label, epoch, path)
     else:
-        _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path)
+        _plot_3d_val(x_grid, u, pred, label, epoch, cfg, path)
 
 
-def _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path):
+def _plot_alucell_val(x_grid, u, pred, score_label, epoch, path):
     """Validation plot for Alucell: contour on mid-ACD plane or bar chart
     for POD coefficients."""
     coords = x_grid.cpu().numpy()
@@ -195,7 +211,7 @@ def _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path):
         ax.bar(x + 0.15, pred_np, width=0.3, label="Pred",  color="tomato")
         ax.set_xlabel("POD mode")
         ax.set_ylabel("Coefficient")
-        ax.set_title(f"Epoch {epoch + 1}  |  Rel-L2 = {rel_l2:.4f}")
+        ax.set_title(f"Epoch {epoch + 1}  |  {score_label}")
         ax.legend()
         fig.savefig(path, dpi=80)
         plt.close(fig)
@@ -213,24 +229,24 @@ def _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path):
         plt.colorbar(sc, ax=ax, label=label)
         ax.set_title(title)
         ax.set_aspect("equal")
-    fig.suptitle(f"Epoch {epoch + 1}  |  Rel-L2 = {rel_l2:.4f}")
+    fig.suptitle(f"Epoch {epoch + 1}  |  {score_label}")
     fig.savefig(path, dpi=80)
     plt.close(fig)
 
 
-def _plot_1d_val(x_grid, u, pred, rel_l2, epoch, path):
+def _plot_1d_val(x_grid, u, pred, score_label, epoch, path):
     x = x_grid.cpu().numpy().flatten()
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(x, u.cpu().numpy(),    label="Ground Truth", color="steelblue", lw=1.5)
     ax.plot(x, pred.cpu().numpy(), label="Prediction",   color="tomato",
             linestyle="--", lw=1.5)
-    ax.set_title(f"Epoch {epoch + 1}  |  Rel-L2 = {rel_l2:.4f}")
+    ax.set_title(f"Epoch {epoch + 1}  |  {score_label}")
     ax.legend()
     fig.savefig(path, dpi=80)
     plt.close(fig)
 
 
-def _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path):
+def _plot_3d_val(x_grid, u, pred, score_label, epoch, cfg, path):
     """z≈mid slice colour map."""
     grid_res = cfg["data"]["grid_res"]
     coords   = x_grid.cpu().numpy()
@@ -251,7 +267,7 @@ def _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path):
         plt.colorbar(im, ax=ax)
         ax.set_title(title)
         ax.set_aspect("equal")
-    fig.suptitle(f"Epoch {epoch + 1}  |  z≈{z_mid:.2f}  |  Rel-L2 = {rel_l2:.4f}")
+    fig.suptitle(f"Epoch {epoch + 1}  |  z≈{z_mid:.2f}  |  {score_label}")
     fig.savefig(path, dpi=80)
     plt.close(fig)
 
@@ -260,30 +276,32 @@ def _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path):
 # Training statistics (rank 0 only)
 # ---------------------------------------------------------------------------
 
+#: Same columns as train.py, so single-GPU and multi-GPU runs are comparable.
+STATS_COLUMNS = ["epoch", "train_loss", "val_rmse", "val_rel_l2", "val_r2",
+                 "lr", "epoch_time_s", "cumulative_time_s"]
+
+
 def _init_stats_csv(path: str):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_rel_l2", "lr",
-                          "epoch_time_s", "cumulative_time_s"])
+        csv.writer(f).writerow(STATS_COLUMNS)
 
 
 def _append_stats_csv(path: str, row: dict):
     with open(path, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([row["epoch"], row["train_loss"], row["val_rel_l2"],
-                          row["lr"], row["epoch_time_s"],
-                          row["cumulative_time_s"]])
+        csv.writer(f).writerow([row[c] for c in STATS_COLUMNS])
 
 
-def _plot_training_curves(stats_path: str, out_path: str):
-    epochs, train_loss, val_rel_l2, lr, epoch_time = [], [], [], [], []
+def _plot_training_curves(stats_path: str, out_path: str,
+                          monitored: str = "rel_l2"):
+    col = f"val_{monitored}"
+    epochs, train_loss, val_metric, lr, epoch_time = [], [], [], [], []
     with open(stats_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
             epochs.append(int(row["epoch"]))
             train_loss.append(float(row["train_loss"]))
-            val_rel_l2.append(float(row["val_rel_l2"]))
+            val_metric.append(float(row[col]))
             lr.append(float(row["lr"]))
             epoch_time.append(float(row["epoch_time_s"]))
 
@@ -296,12 +314,15 @@ def _plot_training_curves(stats_path: str, out_path: str):
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].set_title("Train Loss")
 
-    axes[0, 1].plot(epochs, val_rel_l2, color="tomato", lw=1.5)
-    axes[0, 1].set_ylabel("Val Rel-L2")
+    label = METRIC_LABELS[monitored]
+    axes[0, 1].plot(epochs, val_metric, color="tomato", lw=1.5)
+    axes[0, 1].set_ylabel(f"Val {label}")
     axes[0, 1].set_xlabel("Epoch")
-    axes[0, 1].set_yscale("log")
+    # R^2 can be negative early on, so log scale is not always usable
+    if all(v > 0 for v in val_metric):
+        axes[0, 1].set_yscale("log")
     axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].set_title("Validation Rel-L2")
+    axes[0, 1].set_title(f"Validation {label}  (monitored)")
 
     axes[1, 0].plot(epochs, lr, color="seagreen", lw=1.5)
     axes[1, 0].set_ylabel("Learning Rate")
@@ -341,15 +362,27 @@ def main(config_path: str):
     set_seed(cfg["seed"])
 
     benchmark = cfg.get("benchmark", "1d")
+    monitored = select_val_metric(cfg)
     log(f"Benchmark  : {benchmark}")
     log(f"World size : {world_size} GPUs")
+    log(f"Monitoring : val {METRIC_LABELS[monitored]} "
+        f"(checkpointing + early stopping)")
+    if benchmark == "alucell" and monitored != "rel_l2":
+        log("             rel-L2 is still logged, but it is not meaningful here: "
+            "the target\n"
+            "             is a velocity perturbation, so ||target|| → 0 near the "
+            "reference run.")
 
     # ── 2. Data ──
     h5_path   = cfg["data"]["h5_path"]
     train_cfg = cfg["training"]
+    normalize = cfg["data"].get("normalize", False)
 
-    train_ds = GaussianDataset(h5_path, split="train")
-    val_ds   = GaussianDataset(h5_path, split="val")
+    train_ds = GaussianDataset(h5_path, split="train", normalize=normalize)
+    val_ds   = GaussianDataset(h5_path, split="val",   normalize=normalize)
+    if normalize:
+        log("Targets    : standardised with the train-split u_mean / u_std "
+            "(evaluate.py undoes this)")
 
     if cfg["data"].get("use_subset", False):
         n_sub   = cfg["data"].get("subset_size", cfg["data"]["samples"]["train"])
@@ -403,14 +436,14 @@ def main(config_path: str):
     # ── 5. Training loop ──
     grad_weight      = train_cfg.get("grad_loss_weight", 0.1)
     patience         = train_cfg.get("patience", 30)
-    best_val_loss    = float("inf")
+    best_val         = worst_metric_value(monitored)
     patience_counter = 0
 
     if is_main():
         os.makedirs("models", exist_ok=True)
     dist.barrier()
 
-    model_tag  = cfg["model"]["type"]
+    model_tag  = run_tag(cfg)
     save_path  = f"models/best_model_{model_tag}.pth"
 
     total_epochs = train_cfg["epochs"]
@@ -450,37 +483,36 @@ def main(config_path: str):
                                            x_grid, grad_weight, device)
             lr = optimizer.param_groups[0]["lr"]
 
-        val_loss = val_epoch(model, val_loader, x_grid, device, epoch, cfg)
-
-        # ── Sync val_loss across ranks ──
-        val_tensor = torch.tensor(val_loss, device=device)
-        dist.all_reduce(val_tensor, op=dist.ReduceOp.AVG)
-        val_loss = val_tensor.item()
+        # val_epoch already all-reduces across ranks
+        val = val_epoch(model, val_loader, x_grid, device, epoch, cfg, monitored)
 
         epoch_time = time.perf_counter() - epoch_start
         cumulative_time += epoch_time
 
         log(f"Epoch {epoch + 1:4d}  "
-            f"train={train_loss:.5f}  val_rel_l2={val_loss:.5f}  "
+            f"train={train_loss:.5f}  val_rmse={val['rmse']:.5e}  "
+            f"val_rel_l2={val['rel_l2']:.5f}  val_R2={val['r2']:.4f}  "
             f"lr={lr:.2e}  time={epoch_time:.1f}s")
 
         if is_main():
             _append_stats_csv(stats_csv_path, {
                 "epoch":           epoch + 1,
                 "train_loss":      f"{train_loss:.6f}",
-                "val_rel_l2":      f"{val_loss:.6f}",
+                "val_rmse":        f"{val['rmse']:.6e}",
+                "val_rel_l2":      f"{val['rel_l2']:.6f}",
+                "val_r2":          f"{val['r2']:.6f}",
                 "lr":              f"{lr:.2e}",
                 "epoch_time_s":    f"{epoch_time:.2f}",
                 "cumulative_time_s": f"{cumulative_time:.2f}",
             })
 
-        if val_loss < best_val_loss:
-            best_val_loss    = val_loss
+        if is_better_metric(monitored, val[monitored], best_val):
+            best_val         = val[monitored]
             patience_counter = 0
             if is_main():
                 # Save the underlying model, not the DDP wrapper
                 torch.save(model.module.state_dict(), save_path)
-                log(f"  → New best ({best_val_loss:.5f})")
+                log(f"  → New best {METRIC_LABELS[monitored]} ({best_val:.5e})")
         else:
             patience_counter += 1
             if epoch < adam_epochs and patience_counter >= patience:
@@ -488,13 +520,14 @@ def main(config_path: str):
                 break
 
     # ── 6. Wrap up ──
-    log(f"\nDone. Best val rel-L2: {best_val_loss:.5f}")
+    log(f"\nDone. Best val {METRIC_LABELS[monitored]}: {best_val:.5e}")
     log(f"Total training time : {cumulative_time:.1f}s")
     log(f"Best model → {save_path}")
 
     if is_main():
         _plot_training_curves(stats_csv_path,
-                              f"models/training_curves_{model_tag}.png")
+                              f"models/training_curves_{model_tag}.png",
+                              monitored)
 
     cleanup_ddp()
 

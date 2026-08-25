@@ -25,7 +25,12 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from dataset import GaussianDataset
-from utils import build_model, load_x_grid, set_seed, fit_pod_basis_if_needed
+from utils import (
+    METRIC_LABELS, batch_val_metrics, build_model, fit_pod_basis_if_needed,
+    is_better_metric, load_x_grid, plot_dir, run_tag,
+    select_val_metric, set_seed,
+    worst_metric_value,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -92,55 +97,51 @@ def train_epoch_lbfgs(model, loader, optimizer, x_grid, grad_weight, device):
 
 
 @torch.no_grad()
-def val_epoch(model, loader, x_grid, device, epoch, cfg,
+def val_epoch(model, loader, x_grid, device, epoch, cfg, monitored,
               save_plot_every: int = 5):
+    """Mean RMSE, rel-L2 and R^2 over the whole validation split.
+
+    All three are always computed and logged; *monitored* only decides which
+    one drives checkpointing / early stopping and labels the validation plot.
+    """
     model.eval()
-    total_rmse = 0.0
-    total_r2 = 0.0
     benchmark = cfg.get("benchmark", "1d")
+    totals, n_seen = None, 0.0
 
     for batch_idx, (p, u) in enumerate(loader):
         p, u = p.to(device), u.to(device)
         preds = model(p, x_grid)
-        
-        # 1. RMSE (Stable Absolute Error)
-        mse = torch.mean((preds - u) ** 2, dim=1)
-        rmse = torch.sqrt(mse).mean().item()
-        
-        # 2. R^2 Score (Explained Variance)
-        ss_res = torch.sum((u - preds) ** 2, dim=1)
-        ss_tot = torch.sum((u - u.mean(dim=1, keepdim=True)) ** 2, dim=1)
-        r2 = (1.0 - ss_res / (ss_tot + 1e-12)).mean().item()
 
-        total_rmse += rmse
-        total_r2 += r2
+        sums = batch_val_metrics(preds, u)
+        n_seen += sums.pop("n")
+        totals = sums if totals is None else {k: totals[k] + v
+                                              for k, v in sums.items()}
 
         if batch_idx == 0 and epoch % save_plot_every == 0:
-            # We can pass rmse to the plot function instead of rel_l2
-            _save_val_plot(x_grid, u[0], preds[0], rmse,
+            first = batch_val_metrics(preds[:1], u[:1])
+            _save_val_plot(x_grid, u[0], preds[0], first[monitored], monitored,
                            epoch, benchmark, cfg)
 
-    num_batches = len(loader)
-    return total_rmse / num_batches, total_r2 / num_batches
+    return {k: v / n_seen for k, v in totals.items()}
 
 
 # ---------------------------------------------------------------------------
 # Validation plotting
 # ---------------------------------------------------------------------------
 
-def _save_val_plot(x_grid, u, pred, rel_l2, epoch, benchmark, cfg):
-    os.makedirs("plots", exist_ok=True)
-    path = f"plots/val_epoch_{epoch + 1:04d}.png"
+def _save_val_plot(x_grid, u, pred, score, monitored, epoch, benchmark, cfg):
+    path = os.path.join(plot_dir(cfg), f"val_epoch_{epoch + 1:04d}.png")
+    label = f"{METRIC_LABELS[monitored]} = {score:.4g}"
 
     if benchmark == "alucell":
-        _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path)
+        _plot_alucell_val(x_grid, u, pred, label, epoch, path)
     elif benchmark == "1d":
-        _plot_1d_val(x_grid, u, pred, rel_l2, epoch, path)
+        _plot_1d_val(x_grid, u, pred, label, epoch, path)
     else:
-        _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path)
+        _plot_3d_val(x_grid, u, pred, label, epoch, cfg, path)
 
 
-def _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path):
+def _plot_alucell_val(x_grid, u, pred, score_label, epoch, path):
     """Validation plot for Alucell: contour on mid-ACD plane or interface."""
     coords = x_grid.cpu().numpy()
     M_grid = coords.shape[0]
@@ -151,7 +152,7 @@ def _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path):
     if u_np.shape[0] == M_grid * 3:
         field_true = np.linalg.norm(u_np.reshape(M_grid, 3), axis=1)
         field_pred = np.linalg.norm(pred_np.reshape(M_grid, 3), axis=1)
-        label = "|Δu| (m/s)" if "delta" in path.lower() else "|u| (m/s)"
+        label = "|u| (m/s)"
     elif u_np.shape[0] == M_grid:
         field_true = u_np
         field_pred = pred_np
@@ -165,7 +166,7 @@ def _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path):
         ax.bar(x + 0.15, pred_np, width=0.3, label="Pred",  color="tomato")
         ax.set_xlabel("POD mode")
         ax.set_ylabel("Coefficient")
-        ax.set_title(f"Epoch {epoch + 1}  |  Rel-L2 = {rel_l2:.4f}")
+        ax.set_title(f"Epoch {epoch + 1}  |  {score_label}")
         ax.legend()
         fig.savefig(path, dpi=80)
         plt.close(fig)
@@ -183,24 +184,24 @@ def _plot_alucell_val(x_grid, u, pred, rel_l2, epoch, path):
         plt.colorbar(sc, ax=ax, label=label)
         ax.set_title(title)
         ax.set_aspect("equal")
-    fig.suptitle(f"Epoch {epoch + 1}  |  Rel-L2 = {rel_l2:.4f}")
+    fig.suptitle(f"Epoch {epoch + 1}  |  {score_label}")
     fig.savefig(path, dpi=80)
     plt.close(fig)
 
 
-def _plot_1d_val(x_grid, u, pred, rel_l2, epoch, path):
+def _plot_1d_val(x_grid, u, pred, score_label, epoch, path):
     x = x_grid.cpu().numpy().flatten()
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(x, u.cpu().numpy(),    label="Ground Truth", color="steelblue", lw=1.5)
     ax.plot(x, pred.cpu().numpy(), label="Prediction",   color="tomato",
             linestyle="--", lw=1.5)
-    ax.set_title(f"Epoch {epoch + 1}  |  Rel-L2 = {rel_l2:.4f}")
+    ax.set_title(f"Epoch {epoch + 1}  |  {score_label}")
     ax.legend()
     fig.savefig(path, dpi=80)
     plt.close(fig)
 
 
-def _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path):
+def _plot_3d_val(x_grid, u, pred, score_label, epoch, cfg, path):
     """z≈mid slice colour map."""
     grid_res = cfg["data"]["grid_res"]
     coords   = x_grid.cpu().numpy()
@@ -221,7 +222,7 @@ def _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path):
         plt.colorbar(im, ax=ax)
         ax.set_title(title)
         ax.set_aspect("equal")
-    fig.suptitle(f"Epoch {epoch + 1}  |  z≈{z_mid:.2f}  |  Rel-L2 = {rel_l2:.4f}")
+    fig.suptitle(f"Epoch {epoch + 1}  |  z≈{z_mid:.2f}  |  {score_label}")
     fig.savefig(path, dpi=80)
     plt.close(fig)
 
@@ -230,30 +231,34 @@ def _plot_3d_val(x_grid, u, pred, rel_l2, epoch, cfg, path):
 # Training statistics
 # ---------------------------------------------------------------------------
 
+#: Columns shared by train.py and train_dpp.py — all metrics are always
+#: logged so runs from either script stay directly comparable.
+STATS_COLUMNS = ["epoch", "train_loss", "val_rmse", "val_rel_l2", "val_r2",
+                 "lr", "epoch_time_s", "cumulative_time_s"]
+
+
 def _init_stats_csv(path: str):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_rmse", "lr",
-                          "epoch_time_s", "cumulative_time_s"])
+        csv.writer(f).writerow(STATS_COLUMNS)
 
 
 def _append_stats_csv(path: str, row: dict):
     with open(path, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([row["epoch"], row["train_loss"], row["val_rmse"], row["lr"],
-                          row["epoch_time_s"], row["cumulative_time_s"]])
+        csv.writer(f).writerow([row[c] for c in STATS_COLUMNS])
 
 
 
-def _plot_training_curves(stats_path: str, out_path: str):
-    epochs, train_loss, val_rmse, lr, epoch_time = [], [], [], [], []
+def _plot_training_curves(stats_path: str, out_path: str,
+                          monitored: str = "rel_l2"):
+    col = f"val_{monitored}"
+    epochs, train_loss, val_metric, lr, epoch_time = [], [], [], [], []
     with open(stats_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
             epochs.append(int(row["epoch"]))
             train_loss.append(float(row["train_loss"]))
-            val_rmse.append(float(row["val_rmse"]))
+            val_metric.append(float(row[col]))
             lr.append(float(row["lr"]))
             epoch_time.append(float(row["epoch_time_s"]))
 
@@ -266,12 +271,15 @@ def _plot_training_curves(stats_path: str, out_path: str):
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].set_title("Train Loss")
 
-    axes[0, 1].plot(epochs, val_rmse, color="tomato", lw=1.5)
-    axes[0, 1].set_ylabel("Val RMSE")
+    label = METRIC_LABELS[monitored]
+    axes[0, 1].plot(epochs, val_metric, color="tomato", lw=1.5)
+    axes[0, 1].set_ylabel(f"Val {label}")
     axes[0, 1].set_xlabel("Epoch")
-    axes[0, 1].set_yscale("log")
+    # R^2 can be negative early on, so log scale is not always usable
+    if all(v > 0 for v in val_metric):
+        axes[0, 1].set_yscale("log")
     axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].set_title("Validation RMSE")
+    axes[0, 1].set_title(f"Validation {label}  (monitored)")
 
     axes[1, 0].plot(epochs, lr, color="seagreen", lw=1.5)
     axes[1, 0].set_ylabel("Learning Rate")
@@ -303,15 +311,27 @@ def main(config_path: str):
     set_seed(cfg["seed"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
     benchmark = cfg.get("benchmark", "1d")
+    monitored = select_val_metric(cfg)
     print(f"Benchmark : {benchmark}")
     print(f"Device    : {device}")
+    print(f"Monitoring: val {METRIC_LABELS[monitored]} "
+          f"(checkpointing + early stopping)")
+    if benchmark == "alucell" and monitored != "rel_l2":
+        print("            rel-L2 is still logged, but it is not meaningful here: "
+              "the target\n"
+              "            is a velocity perturbation, so ||target|| → 0 near the "
+              "reference run.")
 
     # --- Data ---
     h5_path    = cfg["data"]["h5_path"]
     train_cfg  = cfg["training"]
+    normalize  = cfg["data"].get("normalize", False)
 
-    train_ds = GaussianDataset(h5_path, split="train")
-    val_ds   = GaussianDataset(h5_path, split="val")
+    train_ds = GaussianDataset(h5_path, split="train", normalize=normalize)
+    val_ds   = GaussianDataset(h5_path, split="val",   normalize=normalize)
+    if normalize:
+        print("Targets   : standardised with the train-split u_mean / u_std "
+              "(evaluate.py undoes this)")
 
     if cfg["data"].get("use_subset", False):
         n_sub    = cfg["data"].get("subset_size", cfg["data"]["samples"]["train"])
@@ -351,11 +371,11 @@ def main(config_path: str):
     # --- Training loop ---
     grad_weight      = train_cfg.get("grad_loss_weight", 0.1)
     patience         = train_cfg.get("patience", 30)
-    best_val_loss    = float("inf")
+    best_val         = worst_metric_value(monitored)
     patience_counter = 0
 
     os.makedirs("models", exist_ok=True)
-    model_tag  = cfg["model"]["type"]
+    model_tag  = run_tag(cfg)
     save_path  = f"models/best_model_{model_tag}.pth"
 
     total_epochs = train_cfg["epochs"]
@@ -393,7 +413,7 @@ def main(config_path: str):
                                            x_grid, grad_weight, device)
             lr = optimizer.param_groups[0]["lr"]
 
-        val_rmse, val_r2 = val_epoch(model, val_loader, x_grid, device, epoch, cfg)
+        val = val_epoch(model, val_loader, x_grid, device, epoch, cfg, monitored)
 
         epoch_time = time.perf_counter() - epoch_start
         cumulative_time += epoch_time
@@ -401,33 +421,37 @@ def main(config_path: str):
         _append_stats_csv(stats_csv_path, {
             "epoch":           epoch + 1,
             "train_loss":      f"{train_loss:.6f}",
-            "val_rmse":      f"{val_rmse:.6e}", # Re-using CSV column for RMSE
+            "val_rmse":        f"{val['rmse']:.6e}",
+            "val_rel_l2":      f"{val['rel_l2']:.6f}",
+            "val_r2":          f"{val['r2']:.6f}",
             "lr":              f"{lr:.2e}",
             "epoch_time_s":    f"{epoch_time:.2f}",
             "cumulative_time_s": f"{cumulative_time:.2f}",
         })
 
         print(f"Epoch {epoch + 1:4d}  "
-              f"train={train_loss:.5f}  val_rmse={val_rmse:.5e}  val_R2={val_r2:.4f}  "
+              f"train={train_loss:.5f}  val_rmse={val['rmse']:.5e}  "
+              f"val_rel_l2={val['rel_l2']:.5f}  val_R2={val['r2']:.4f}  "
               f"lr={lr:.2e}  time={epoch_time:.1f}s")
 
-        if val_rmse < best_val_loss:
-            best_val_loss    = val_rmse
+        if is_better_metric(monitored, val[monitored], best_val):
+            best_val         = val[monitored]
             patience_counter = 0
             torch.save(model.state_dict(), save_path)
-            print(f"  → New best ({best_val_loss:.5f})")
+            print(f"  → New best {METRIC_LABELS[monitored]} ({best_val:.5e})")
         else:
             patience_counter += 1
             if epoch < adam_epochs and patience_counter >= patience:
                 print(f"Early stopping at epoch {epoch + 1}.")
                 break
 
-    print(f"\nDone. Best val rel-L2: {best_val_loss:.5f}")
+    print(f"\nDone. Best val {METRIC_LABELS[monitored]}: {best_val:.5e}")
     print(f"Total training time : {cumulative_time:.1f}s")
     print(f"Best model → {save_path}")
 
     _plot_training_curves(stats_csv_path,
-                          f"models/training_curves_{model_tag}.png")
+                          f"models/training_curves_{model_tag}.png",
+                          monitored)
 
 
 if __name__ == "__main__":

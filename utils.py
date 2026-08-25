@@ -1,11 +1,13 @@
 """
-Shared utilities: seeding, model factory, POD basis fitting.
+Shared utilities: seeding, validation metrics, model factory, POD basis fitting.
 
 The model factory (build_model) is the single source of truth for
 instantiation, used by both train.py and evaluate.py.
 """
 
+import os
 import random
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -30,6 +32,53 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+# ---------------------------------------------------------------------------
+# Artefact naming
+# ---------------------------------------------------------------------------
+
+def run_tag(cfg: dict) -> str:
+    """Identifier for a (dataset, model) pair, used to name every artefact.
+
+    Naming artefacts by model type alone collides whenever two mappings share
+    an architecture.  The Alucell mid-ACD and interface surrogates are both
+    POD_MLP, so both wrote models/best_model_POD_MLP.pth and whichever was
+    trained second silently destroyed the first — along with its training log
+    and its validation plots.  Including the dataset stem separates them.
+    """
+    stem = Path(cfg["data"]["h5_path"]).stem
+    return f"{cfg['model']['type']}__{stem}"
+
+
+def checkpoint_path(cfg: dict) -> str:
+    """Where training writes this run's weights."""
+    return f"models/best_model_{run_tag(cfg)}.pth"
+
+
+def resolve_checkpoint(cfg: dict) -> str:
+    """Checkpoint to load, tolerating weights trained before the rename.
+
+    Falls back to the old type-only name when only that exists, so existing
+    checkpoints keep working; the note tells the user how to migrate.
+    """
+    preferred = checkpoint_path(cfg)
+    if os.path.exists(preferred):
+        return preferred
+    legacy = f"models/best_model_{cfg['model']['type']}.pth"
+    if os.path.exists(legacy):
+        print(f"[note] loading legacy checkpoint {legacy}\n"
+              f"       (retrain, or rename it to {preferred}, to keep this "
+              f"dataset's weights separate)")
+        return legacy
+    return preferred
+
+
+def plot_dir(cfg: dict) -> str:
+    """Per-run directory for validation plots, created on demand."""
+    d = os.path.join("plots", run_tag(cfg))
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +116,81 @@ def _detect_M_from_h5(cfg: dict) -> int:
             return int(f["meta"].attrs["M_out"])
         # Fallback: read from training data shape
         return f["train"]["U"].shape[1]
+
+
+# ---------------------------------------------------------------------------
+# Validation metrics
+# ---------------------------------------------------------------------------
+
+#: Human-readable names, used in logs and plot titles.
+METRIC_LABELS = {"rmse": "RMSE", "rel_l2": "rel-L2", "r2": "R2"}
+
+#: Metric monitored for checkpointing / early stopping, per benchmark.
+#:
+#: Relative L2 is meaningful on the analytic benchmarks: the target IS the
+#: field, so ||target|| is O(1).  It is NOT meaningful for Alucell, where the
+#: target is a velocity perturbation (delta-learning against the uniform-current
+#: reference run) or its POD coefficients.  There ||target|| -> 0 for samples
+#: close to the reference, so the ratio blows up precisely where the model is
+#: most accurate.  Alucell is monitored on RMSE instead, with R2 reporting how
+#: much of the perturbation was captured.
+_DEFAULT_VAL_METRIC = {"alucell": "rmse"}
+
+
+def select_val_metric(cfg: dict) -> str:
+    """Return the metric name used for early stopping and checkpointing.
+
+    Override per run with training.val_metric in the config file.
+    """
+    default = _DEFAULT_VAL_METRIC.get(cfg.get("benchmark", "1d"), "rel_l2")
+    metric  = cfg.get("training", {}).get("val_metric", default)
+    if metric not in METRIC_LABELS:
+        raise ValueError(
+            f"Unknown training.val_metric '{metric}'. "
+            f"Available: {list(METRIC_LABELS)}"
+        )
+    return metric
+
+
+def worst_metric_value(metric: str) -> float:
+    """Initial 'best so far' value for *metric* (R2 is maximised)."""
+    return -float("inf") if metric == "r2" else float("inf")
+
+
+def is_better_metric(metric: str, value: float, best: float) -> bool:
+    """True if *value* improves on *best* (R2 is maximised, others minimised)."""
+    return value > best if metric == "r2" else value < best
+
+
+@torch.no_grad()
+def batch_val_metrics(preds: torch.Tensor, targets: torch.Tensor) -> dict:
+    """Per-sample validation metrics, SUMMED over the batch.
+
+    Sums (plus the sample count under key "n") rather than means, so callers can
+    accumulate across batches — and, under DDP, across ranks — and divide once.
+    Averaging per-batch means would weight a short final batch too heavily.
+
+    Args:
+        preds, targets: [B, M] model output and ground truth.
+
+    Returns:
+        dict with keys rmse, rel_l2, r2, n — all Python floats.
+    """
+    diff = preds - targets
+
+    rmse   = torch.sqrt(diff.pow(2).mean(dim=1))
+    rel_l2 = diff.norm(dim=1) / (targets.norm(dim=1) + 1e-12)
+
+    ss_res = diff.pow(2).sum(dim=1)
+    ss_tot = (targets - targets.mean(dim=1, keepdim=True)).pow(2).sum(dim=1)
+    r2     = 1.0 - ss_res / (ss_tot + 1e-12)
+
+    return {
+        "rmse":   float(rmse.sum()),
+        "rel_l2": float(rel_l2.sum()),
+        "r2":     float(r2.sum()),
+        "n":      float(preds.shape[0]),
+    }
 
 
 # ---------------------------------------------------------------------------

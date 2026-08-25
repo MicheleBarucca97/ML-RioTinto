@@ -30,9 +30,16 @@ from dataset import (
     reconstruct_field,
     load_test_modes,
 )
-from utils import build_model, load_x_grid
+from utils import build_model, load_x_grid, resolve_checkpoint, run_tag
 
-from plot_alucell_3d import plot_alucell_3d
+# plot_alucell_3d is imported lazily inside plot_results: it pulls in PyVista,
+# which is only needed for the 3-D Alucell renders and is not installed in
+# every environment.  A module-level import would break the 1-D/3-D benchmarks.
+
+
+def _plot_path(cfg: dict) -> str:
+    """Output figure, named per (dataset, model) so runs do not overwrite."""
+    return f"evaluation_plots_{run_tag(cfg)}.png"
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +154,8 @@ def _plot_alucell(preds, targets, x_grid, metrics, indices, cfg, recon_preds=Non
             ax.set_title(f"Sample {idx}  |  Rel-L2={metrics['rel_l2'][idx]:.4f}")
             ax.legend(fontsize=8)
         plt.tight_layout()
-        plt.savefig("evaluation_plots.png", dpi=120)
-        print("Plots saved → evaluation_plots.png")
+        plt.savefig(_plot_path(cfg), dpi=120)
+        print(f"Plots saved → {_plot_path(cfg)}")
         plt.close(fig)
         return
 
@@ -196,8 +203,8 @@ def _plot_alucell(preds, targets, x_grid, metrics, indices, cfg, recon_preds=Non
 
     plt.suptitle(f"Alucell — {cfg['model']['type']}", fontsize=14)
     plt.tight_layout()
-    plt.savefig("evaluation_plots.png", dpi=120)
-    print("Plots saved → evaluation_plots.png")
+    plt.savefig(_plot_path(cfg), dpi=120)
+    print(f"Plots saved → {_plot_path(cfg)}")
     plt.close(fig)
 
 
@@ -205,7 +212,7 @@ def _plot_alucell(preds, targets, x_grid, metrics, indices, cfg, recon_preds=Non
 # Plots — original benchmarks
 # ---------------------------------------------------------------------------
 
-def _plot_1d(preds, targets, x_grid, metrics, indices):
+def _plot_1d(preds, targets, x_grid, metrics, indices, cfg):
     x   = x_grid.cpu().numpy().flatten()
     fig, axes = plt.subplots(len(indices), 1,
                              figsize=(9, 3 * len(indices)), sharex=True)
@@ -225,8 +232,8 @@ def _plot_1d(preds, targets, x_grid, metrics, indices):
         ax.grid(True, alpha=0.3)
     plt.xlabel("x")
     plt.tight_layout()
-    plt.savefig("evaluation_plots.png", dpi=120)
-    print("Plots saved → evaluation_plots.png")
+    plt.savefig(_plot_path(cfg), dpi=120)
+    print(f"Plots saved → {_plot_path(cfg)}")
     plt.close(fig)
 
 
@@ -265,8 +272,8 @@ def _plot_3d(preds, targets, x_grid, metrics, indices, cfg):
 
     plt.suptitle(f"3-D benchmark evaluation  (z≈{z_mid:.2f} slice)")
     plt.tight_layout()
-    plt.savefig("evaluation_plots.png", dpi=120)
-    print("Plots saved → evaluation_plots.png")
+    plt.savefig(_plot_path(cfg), dpi=120)
+    print(f"Plots saved → {_plot_path(cfg)}")
     plt.close(fig)
 
 
@@ -284,13 +291,19 @@ def plot_results(preds, targets, x_grid, metrics, cfg,
     if benchmark == "alucell":
         spatial_dim = cfg["data"].get("spatial_dim", 2)
         if spatial_dim == 3 and recon_preds is not None:
+            try:
+                from plot_alucell_3d import plot_alucell_3d
+            except ImportError as e:
+                print(f"3-D Alucell plots need PyVista ({e}); "
+                      f"install with: pip install 'pyvista[all]'")
+                return
             plot_alucell_3d(preds, targets, x_grid, metrics, indices, cfg,
                             recon_preds=recon_preds, recon_targets=recon_targets)
         else:
             _plot_alucell(preds, targets, x_grid, metrics, indices, cfg,
                           recon_preds=recon_preds, recon_targets=recon_targets)
     elif benchmark == "1d":
-        _plot_1d(preds, targets, x_grid, metrics, indices)
+        _plot_1d(preds, targets, x_grid, metrics, indices, cfg)
     else:
         _plot_3d(preds, targets, x_grid, metrics, indices, cfg)
 
@@ -304,8 +317,7 @@ def evaluate(config_path: str, model_path: str | None = None, n_plots: int = 5):
         cfg = yaml.safe_load(f)
 
     if model_path is None:
-        model_tag  = cfg["model"]["type"]
-        model_path = f"models/best_model_{model_tag}.pth"
+        model_path = resolve_checkpoint(cfg)
 
     device    = "cuda" if torch.cuda.is_available() else "cpu"
     benchmark = cfg.get("benchmark", "1d")
@@ -315,9 +327,15 @@ def evaluate(config_path: str, model_path: str | None = None, n_plots: int = 5):
     print(f"Device    : {device}")
 
     # --- Data ---
-    test_ds     = GaussianDataset(h5_path, split="test")
+    # Must match training: if the targets were standardised there, the model
+    # predicts in standardised space and we undo it below so that every metric
+    # and every reconstruction stays in physical units.
+    normalize   = cfg["data"].get("normalize", False)
+    test_ds     = GaussianDataset(h5_path, split="test", normalize=normalize)
     test_loader = DataLoader(test_ds, batch_size=16, shuffle=False, num_workers=2)
     print(f"Test set  : {len(test_ds)} samples")
+    if normalize:
+        print("Targets   : standardised — de-normalising model output for metrics")
 
     x_grid = load_x_grid(cfg, device)
     print(f"x_grid    : {tuple(x_grid.shape)}")
@@ -332,15 +350,31 @@ def evaluate(config_path: str, model_path: str | None = None, n_plots: int = 5):
     # --- Inference (model-output space) ---
     preds, targets = run_inference(model, test_loader, x_grid, device)
 
+    if normalize:
+        u_mean = test_ds.u_mean.numpy()
+        u_std  = test_ds.u_std.numpy()
+        preds   = preds   * u_std + u_mean
+        targets = targets * u_std + u_mean
+
     # --- Metrics in model-output space ---
     metrics_raw = compute_metrics(preds, targets)
     print_metrics(metrics_raw, len(preds), label="model-output space")
 
     # --- Reconstruction & physical-space metrics (Alucell only) ---
-    recon_preds = None
+    recon_preds   = None
+    recon_targets = None
+    needs_recon   = False
     if benchmark == "alucell":
         ctx = load_reconstruction_context(h5_path)
         needs_recon = ctx["delta_learning"] or ctx["V"] is not None
+
+        if ctx["delta_learning"]:
+            print("  note: rel-L2 above is NOT meaningful — the target is a velocity"
+                  " perturbation\n"
+                  "        Δu, so ||Δu_true|| → 0 for runs close to the reference."
+                  "  Use RMSE / R^2\n"
+                  "        here, and the reconstructed-field metrics below for"
+                  " engineering accuracy.")
 
         if needs_recon:
             recon_preds   = reconstruct_field(preds, ctx)

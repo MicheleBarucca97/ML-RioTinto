@@ -60,6 +60,9 @@ data:
   # M_out is read from the HDF5 automatically
 
   use_subset: no
+  normalize: false        # standardise P and U with the train-split stats.
+                          # Leave off for POD-coefficient targets — the
+                          # coefficients are already scaled by the SVD.
 
 # --------------------------------------------------------------------------
 # Training
@@ -71,6 +74,14 @@ training:
   weight_decay: 1.0e-4
   patience: 50
   num_workers: 4
+
+  # Monitored for early stopping / checkpointing.  Defaults to rmse here and
+  # NOT rel_l2: the target is a velocity perturbation Δu (or its POD
+  # coefficients), so ||Δu_true|| → 0 for runs near the uniform-current
+  # reference and the relative error blows up exactly where the model is best.
+  # rel_l2 is still logged every epoch, and evaluate.py reports it on the
+  # reconstructed physical field, where it IS meaningful.
+  val_metric: rmse
 
   # Set to 0.0 for unstructured meshes or POD coefficients.
   grad_loss_weight: 0.0

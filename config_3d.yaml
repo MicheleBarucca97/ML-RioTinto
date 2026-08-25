@@ -13,8 +13,11 @@ data:
     val:   200
     test:  100
   use_subset: no
+  normalize: false      # standardise P and U with the train-split stats
+                        # (evaluate.py undoes it before computing metrics)
 
 training:
+  # val_metric: rel_l2 | rmse | r2  (default rel_l2 for the benchmarks)
   epochs: 300
   batch_size: 8
   lr: 0.001

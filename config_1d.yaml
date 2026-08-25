@@ -14,8 +14,13 @@ data:
     val:   100
     test:  100
   use_subset: false     # set true + subset_size to train on fewer samples
+  normalize: false      # standardise P and U with the train-split stats
+                        # (evaluate.py undoes it before computing metrics)
 
 training:
+  # val_metric: rel_l2 | rmse | r2  — monitored for early stopping and
+  # checkpointing.  Default: rel_l2 for the benchmarks (the target IS the
+  # field, so ||target|| is O(1)), rmse for Alucell.
   batch_size: 64
   epochs: 400
   lr: 1.0e-3

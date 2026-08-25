@@ -147,13 +147,19 @@ def _check_consistent_grid(master, run_names, grid_path):
 
 
 # ======================================================================
-# Field extractors — return (P, U_raw, x_grid, u_ref, field_shape)
+# Field extractors
+# — return (P, U_raw, x_grid, u_ref, field_shape, kept_names)
 #
 #   P:           [N, 24]       anode currents (raw amperes)
 #   U_raw:       [N, M_field]  field values (possibly delta-subtracted)
 #   x_grid:      [M_grid, d]   spatial coords for plotting
 #   u_ref:       [M_field] or None
 #   field_shape: tuple e.g. (M_nodes, 3) for vector fields
+#   kept_names:  [N] run names, in the SAME order as the rows of P and U.
+#                An extractor may skip runs (e.g. one missing an interface
+#                mesh), so the caller must label modes from this list and
+#                never from the unfiltered run_names — otherwise every mode
+#                label after the first skipped run is off by one.
 # ======================================================================
 
 def extract_velocity_midacd(master, run_names, ref_name, do_delta, **kw):
@@ -185,7 +191,7 @@ def extract_velocity_midacd(master, run_names, ref_name, do_delta, **kw):
         U -= u_ref[None, :]
 
     print(f"  velocity_midacd: P{P.shape}, U{U.shape}, grid{x_grid.shape}")
-    return P, U, x_grid, u_ref, field_shape
+    return P, U, x_grid, u_ref, field_shape, list(run_names)
 
 
 def extract_velocity_full(master, run_names, ref_name, do_delta, **kw):
@@ -269,7 +275,7 @@ def extract_velocity_full(master, run_names, ref_name, do_delta, **kw):
     extract_velocity_full._fluid_elems = fluid_elems_local
     extract_velocity_full._fluid_refs  = fluid_refs
  
-    return P, U, x_grid_ref, u_ref, field_shape
+    return P, U, x_grid_ref, u_ref, field_shape, list(run_names)
 
 
 def extract_interface(master, run_names, ref_name, do_delta,
@@ -307,6 +313,7 @@ def extract_interface(master, run_names, ref_name, do_delta,
     N = len(run_names)
     P = np.empty((N, N_ANODES), dtype=np.float32)
     U = np.empty((N, M),        dtype=np.float32)
+    kept_names = []
     valid = 0
     for name in run_names:
         grp = master[name]
@@ -319,8 +326,13 @@ def extract_interface(master, run_names, ref_name, do_delta,
         
         P[valid] = grp["input/currents"][:].astype(np.float32).ravel()[:N_ANODES]
         U[valid] = _interp(nodes[:, :2], z_vals, xy_target).astype(np.float32)
+        kept_names.append(name)
         valid += 1
     P, U = P[:valid], U[:valid]
+
+    n_skipped = len(run_names) - valid
+    if n_skipped:
+        print(f"  [WARN] {n_skipped} run(s) skipped: no '{int_node_path}'")
 
     u_ref = None
     if do_delta:
@@ -335,7 +347,7 @@ def extract_interface(master, run_names, ref_name, do_delta,
         U -= u_ref[None, :]
 
     print(f"  interface: P{P.shape}, U{U.shape}, grid{x_grid.shape}")
-    return P, U, x_grid, u_ref, field_shape
+    return P, U, x_grid, u_ref, field_shape, kept_names
 
 
 EXTRACTORS = {
@@ -647,10 +659,14 @@ def main():
 
     # ── Extract raw field ──
     extractor = EXTRACTORS[args.mapping]
-    P, U_raw, x_grid, u_ref, field_shape = extractor(
+    P, U_raw, x_grid, u_ref, field_shape, kept_names = extractor(
         master, run_names, ref_name, args.delta,
         grid_res=args.interface_res)
     master.close()
+
+    # kept_names is the ground truth for row → run identity from here on.
+    assert len(kept_names) == len(P), (
+        f"extractor returned {len(kept_names)} names for {len(P)} rows")
 
     M_field = U_raw.shape[1]
 
@@ -669,16 +685,9 @@ def main():
     # ── Normalize inputs ──
     P_norm, norm_info = normalize_currents(P, method=args.input_norm)
 
-    # ── Assign campaign modes ──
-    if args.manifest:
-        f2m   = _load_manifest_modes(args.manifest)
-        modes = [f2m.get(n, "unknown") for n in run_names[:len(P)]]
-    else:
-        modes = [_infer_mode(P[i], args.dead_threshold) for i in range(len(P))]
-
-    # ── Stratified split ──
+    # ── Stratified split (also assigns the campaign mode of every row) ──
     train_idx, val_idx, test_idx, modes = stratified_split(
-        len(P_norm), run_names[:len(P_norm)], ratios,
+        len(P_norm), kept_names, ratios,
         manifest_path=args.manifest, P=P,
         dead_thresh=args.dead_threshold, seed=args.seed)
 
