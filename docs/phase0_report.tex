@@ -3557,7 +3557,12 @@ values.
 (meshes), \verb|s_g01|--\verb|s_g12| (solves, each a \verb|run.h5|) and
 \verb|d_g01|--\verb|d_g12| (the undeformed-mesh dumps). The design point of each
 is in its own \verb|data/_geometrical_params.mac|. Relabelling and the spectra:
-\verb|canonical_relabel.py {cuveb,interface} {check,spectra} d_g01 ... d_g12|.
+\verb|canonical_relabel.py {cuveb,interface} {check,spectra} <dirs>|, with the
+twelve geometry directories taken from \verb|$GEOM_ROOT| (default
+\verb|~/alucell_runs/geometry_pilot|). The script reads
+\verb|ASCII_cuveb_nodes_initial| from each, which is written by the
+\verb|export_initial_cuveb| gate in \verb|stat_dataset/stationary.mac| and is not
+kept between campaigns; regenerate before running.
 
 \noindent
 All model-touching scripts require \verb|/home/barucca/miniconda3/bin/python|
@@ -3568,6 +3573,49 @@ local copy being an interrupted transfer short by $4\,689\,015\,120$ bytes.
 
 
 % =====================================================================
+
+\paragraph{The feeding study (Section~\ref{sec:feeding})}
+All of it runs from the repository root; the analysis scripts are under
+\verb|analysis/feeding/|.
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+quantity & how it was produced \\
+\midrule
+noise floor, Section~\ref{sec:feeding-floor}
+  & seven cyclic rotations of the firing order, then \\
+  & \verb|noise_floor_analyse.py <run-dir>| \\
+weight design, 45 points
+  & \verb|hofer_design.py design_hofer.csv| \\
+frequency design, 211 points
+  & \verb|level3_design.py design.csv| \\
+campaign scoring
+  & \verb|level3_analyse.py <results-dir>| \\
+solver velocity for a run
+  & \verb|truth_velocity_for_alumin.py <run> <out>| \\
+network velocity for a run
+  & \verb|surrogate_velocity_for_alumin.py --run <id>| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The objective is read from \verb|control/CONTROL_MEANVAR_SUMMARY.csv| and
+averaged over $168\,\mathrm{s}$ windows, which is a whole number of feeding
+periods for every configuration considered. Convergence is judged by the movement
+of that average between five and thirty kiloseconds, never by the change over two
+consecutive periods: a configuration passes through a turning point where the
+latter falls to $0.05\%$ while the former is still tens of percent.
+
+The cluster runs are under \verb|/work/gr-pi/alu-data/CNG/CNG2/level3| on jed:
+the withdrawn frequency enumeration is SLURM array 66799504 (436 tasks), the
+stabilisation sweep of Section~\ref{sec:feeding-mesh} is 66981467, and the
+ordering test is 67016373. The coarse-mesh runs of
+Section~\ref{sec:feeding-coarse} are local, under \verb|~/alumina_meshtest|.
+Run directories are not kept in the repository; \verb|docs/RUNS.md| records where
+each one lives.
+
 \begin{thebibliography}{99}
 \small
 
