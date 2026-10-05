@@ -11,7 +11,7 @@ Mappings  (--mapping)
 --------
   velocity_midacd   I[24] → fiber-averaged velocity on mid-ACD plane   [M_mid × 3]
   velocity_full     I[24] → full 3D velocity field (all nodes)         [M_full × 3]
-  interface         I[24] → interface displacement h(x,y)              [M_int]
+  interface         I[24] → interface elevation z on its native mesh    [M_int]
 
 Reduction  (--pod)
 ---------
@@ -70,6 +70,7 @@ Output HDF5 schema
                               u_pod_mean [M_field]   (if pod)
                               evr       [k]          (if pod)
                               cumevr    [k]          (if pod)
+                              evr_full  [N_train]    (if pod)
   {train,val,test}/P          [N, 24]
   {train,val,test}/U          [N, M_out]   (M_out = k if pod, else M_field)
   {train,val,test}/modes      [N] string
@@ -279,11 +280,98 @@ def extract_velocity_full(master, run_names, ref_name, do_delta, **kw):
 
 
 def extract_interface(master, run_names, ref_name, do_delta,
-                      grid_res=64, **kw):
-    # We no longer need field_path = "fields_interface/h"
+                      grid_res=0, **kw):
+    """Extract the interface elevation z(x, y).
+
+    Two representations, selected by `grid_res`:
+
+    grid_res = 0 (default) -- the NATIVE interface mesh.  The stored value is
+        z at node k, for the same 6,125 nodes in every run.  The nodes are
+        displaced between runs, by up to 5.6 mm horizontally, and this
+        representation ignores that: node k is treated as the same sample
+        point throughout.  That is safe here because the interface is nearly
+        flat -- 7 cm of relief over a 17.3 m cell, median |grad h| = 0.004 --
+        so the height error a 5.6 mm horizontal shift induces has median 0
+        and 95th percentile 0.04 mm, against a 70 mm range.
+
+    grid_res > 0 -- LEGACY: resample onto a grid_res x grid_res grid inset 2%
+        from the campaign-wide bounding box, via linear interpolation of the
+        scattered node heights.  Retained only to reproduce earlier datasets.
+        The inset trims 4% of the cell length, and because the metal pad tilts
+        the two short ends carry BOTH extremes of the interface, so the grid
+        discards ~35% of the elevation range: 7.0 cm becomes 4.5 cm.  Raising
+        the resolution does not help -- 175x64 loses the same 35% -- because
+        the loss is the inset, not the sampling.  That is three orders of
+        magnitude more damage than the mesh motion it was introduced to
+        remove.
+    """
     int_node_path = "mesh/interface_nodes"
 
-    # Bounding box
+    if grid_res and grid_res > 0:
+        return _extract_interface_grid(master, run_names, ref_name, do_delta,
+                                       grid_res, int_node_path)
+
+    # ── Native mesh: the reference run fixes the node set and the (x, y) ──
+    if int_node_path not in master[ref_name]:
+        sys.exit(f"Reference run '{ref_name}' has no '{int_node_path}'.")
+    ref_nodes = master[ref_name][int_node_path][:].astype(np.float64)
+    M = ref_nodes.shape[0]
+    x_grid = ref_nodes[:, :2].astype(np.float32)
+    field_shape = (M, 1)
+
+    N = len(run_names)
+    P = np.empty((N, N_ANODES), dtype=np.float32)
+    U = np.empty((N, M),        dtype=np.float32)
+    kept_names = []
+    valid = 0
+    n_missing = n_wrong_size = 0
+    max_disp = 0.0
+
+    for name in run_names:
+        grp = master[name]
+        if int_node_path not in grp:
+            n_missing += 1
+            continue
+        nodes = grp[int_node_path][:].astype(np.float64)
+        if nodes.shape[0] != M:
+            # A different node count means the meshes are not in correspondence
+            # and node k is not the same point; such a run cannot be stacked.
+            n_wrong_size += 1
+            continue
+        max_disp = max(max_disp, float(
+            np.linalg.norm(nodes[:, :2] - ref_nodes[:, :2], axis=1).max()))
+        P[valid] = grp["input/currents"][:].astype(np.float32).ravel()[:N_ANODES]
+        U[valid] = nodes[:, 2].astype(np.float32)
+        kept_names.append(name)
+        valid += 1
+
+    P, U = P[:valid], U[:valid]
+    if n_missing:
+        print(f"  [WARN] {n_missing} run(s) skipped: no '{int_node_path}'")
+    if n_wrong_size:
+        print(f"  [WARN] {n_wrong_size} run(s) skipped: interface node count "
+              f"differs from the reference ({M}); meshes not in correspondence")
+
+    u_ref = None
+    if do_delta:
+        u_ref = ref_nodes[:, 2].astype(np.float32)
+        U -= u_ref[None, :]
+
+    print(f"  interface (native mesh): P{P.shape}, U{U.shape}, grid{x_grid.shape}")
+    print(f"  max horizontal node displacement vs the reference: "
+          f"{max_disp * 1e3:.2f} mm "
+          f"(ignored; see the docstring for why that is safe here)")
+    return P, U, x_grid, u_ref, field_shape, kept_names
+
+
+def _extract_interface_grid(master, run_names, ref_name, do_delta,
+                            grid_res, int_node_path):
+    """Legacy fixed-grid resampling.  See extract_interface for why not to."""
+    print(f"  [WARN] --interface-res {grid_res} resamples onto a fixed grid "
+          f"inset 2% from the bounding box.")
+    print(f"  [WARN] That inset discards ~35% of the interface elevation range "
+          f"(both extremes lie in the trimmed end bands).")
+
     x_all, y_all = [], []
     for name in run_names:
         if int_node_path not in master[name]:
@@ -307,7 +395,8 @@ def extract_interface(master, run_names, ref_name, do_delta,
         val = griddata(nodes_2d, target_vals, xy, method='linear')
         nans = np.isnan(val)
         if nans.any():
-            val[nans] = griddata(nodes_2d, target_vals, xy[nans], method='nearest')
+            val[nans] = griddata(nodes_2d, target_vals, xy[nans],
+                                 method='nearest')
         return val
 
     N = len(run_names)
@@ -319,13 +408,9 @@ def extract_interface(master, run_names, ref_name, do_delta,
         grp = master[name]
         if int_node_path not in grp:
             continue
-        nodes  = grp[int_node_path][:].astype(np.float64)
-        
-        # THE FIX: Extract the absolute Z coordinate of the interface mesh
-        z_vals = nodes[:, 2]
-        
+        nodes = grp[int_node_path][:].astype(np.float64)
         P[valid] = grp["input/currents"][:].astype(np.float32).ravel()[:N_ANODES]
-        U[valid] = _interp(nodes[:, :2], z_vals, xy_target).astype(np.float32)
+        U[valid] = _interp(nodes[:, :2], nodes[:, 2], xy_target).astype(np.float32)
         kept_names.append(name)
         valid += 1
     P, U = P[:valid], U[:valid]
@@ -336,17 +421,13 @@ def extract_interface(master, run_names, ref_name, do_delta,
 
     u_ref = None
     if do_delta:
-        rg = master[ref_name]
-        ref_nodes = rg[int_node_path][:].astype(np.float64)
-        
-        # Extract the absolute Z coordinate of the REFERENCE run
-        ref_z = ref_nodes[:, 2]
-        u_ref = _interp(ref_nodes[:, :2], ref_z, xy_target).astype(np.float32)
-        
-        # U -= u_ref now naturally computes the total cumulative physical \Delta Z
+        ref_nodes = master[ref_name][int_node_path][:].astype(np.float64)
+        u_ref = _interp(ref_nodes[:, :2], ref_nodes[:, 2],
+                        xy_target).astype(np.float32)
         U -= u_ref[None, :]
 
-    print(f"  interface: P{P.shape}, U{U.shape}, grid{x_grid.shape}")
+    print(f"  interface (legacy {grid_res}x{grid_res} grid): "
+          f"P{P.shape}, U{U.shape}, grid{x_grid.shape}")
     return P, U, x_grid, u_ref, field_shape, kept_names
 
 
@@ -361,59 +442,87 @@ EXTRACTORS = {
 # Offline POD (optional reduction step)
 # ======================================================================
 
-def apply_pod(U_raw, n_modes):
+def apply_pod(U_raw, n_modes, fit_idx=None):
     """Coupled POD on snapshot matrix U_raw [N, M_field].
 
-    For vector fields (M_field = M_nodes × 3), the SVD operates on the
-    concatenated vector.  Each mode φ_k ∈ R^{M_field} therefore captures
-    correlated patterns across all three velocity components — this is the
+    For vector fields (M_field = M_nodes x 3), the SVD operates on the
+    concatenated vector.  Each mode phi_k in R^{M_field} therefore captures
+    correlated patterns across all three velocity components -- this is the
     standard "vector POD" used in fluid mechanics.
+
+    The basis is fitted on `fit_idx` only (the training rows) and then used
+    to project every row.  Fitting on all rows would let the basis and the
+    mean see the validation/test snapshots.
+
+    Explained-variance ratios are normalised by the TOTAL variance of the
+    fit set (all N_fit eigenvalues), not by the energy of the k retained
+    modes, so cumevr[-1] < 1 and n99 is measured against the real spectrum.
 
     Returns:
         C:          [N, k]         coefficient matrix (training target)
         pod_info:   dict with V [M_field, k], u_pod_mean [M_field],
-                    evr [k], cumevr [k]
+                    evr [k], cumevr [k], evr_full [N_fit]
     """
-    N, M = U_raw.shape
+    N_all, M = U_raw.shape
+    fit = np.arange(N_all) if fit_idx is None else np.asarray(fit_idx)
+    U_fit = U_raw[fit]
+    N = len(fit)
     k = min(n_modes, N - 1, M)
 
-    u_mean = U_raw.mean(axis=0)
-    Uc = U_raw - u_mean
+    u_mean = U_fit.mean(axis=0)
+    Uc = U_fit - u_mean
 
-    print(f"  Computing coupled POD ({k} modes on {M}-dim field)…")
+    print(f"  Computing coupled POD ({k} modes on {M}-dim field, "
+          f"fitted on {N}/{N_all} rows)...")
 
-    # Gram-matrix trick: N×N eigendecomposition (O(N²M) vs O(NM²))
+    # Gram-matrix trick: N x N eigendecomposition (O(N^2 M) vs O(N M^2))
     G = (Uc @ Uc.T) / max(N - 1, 1)
-    eigvals, eigvecs = np.linalg.eigh(G.astype(np.float64))
-    idx = np.argsort(eigvals)[::-1][:k]
-    eigvals = np.maximum(eigvals[idx], 0.0)
-    eigvecs = eigvecs[:, idx].astype(np.float32)
+    w, Q = np.linalg.eigh(G.astype(np.float64))
+    order = np.argsort(w)[::-1]
+    w = np.maximum(w[order], 0.0)          # FULL spectrum, descending
+    total_var = max(w.sum(), 1e-30)        # = trace(G) = ||Uc||_F^2 / (N-1)
 
-    # Recover right singular vectors (POD modes)
+    eigvals = w[:k]
+    eigvecs = Q[:, order[:k]].astype(np.float32)
+
+    # Recover right singular vectors (POD modes).  Normalise in float64:
+    # a float32 reduction over M ~ 1e5 terms leaves ~1e-4 error in the
+    # column norms of the trailing modes.
     V = Uc.T @ eigvecs                           # [M, k]
-    norms = np.linalg.norm(V, axis=0, keepdims=True).clip(min=1e-12)
-    V = V / norms                                 # orthonormal
+    norms = np.linalg.norm(V.astype(np.float64), axis=0,
+                           keepdims=True).clip(min=1e-12)
+    V = (V / norms).astype(np.float32)           # orthonormal
 
-    # Project snapshots → coefficients
-    C = Uc @ V                                    # [N, k]
+    # Project ALL snapshots (not just the fit set) -> coefficients
+    C = (U_raw - u_mean) @ V                     # [N_all, k]
 
-    evr = eigvals / max(eigvals.sum(), 1e-30)
+    evr_full = w / total_var                     # over the whole spectrum
+    evr    = evr_full[:k]
     cumevr = np.cumsum(evr)
-    eff_rank = 1.0 / max(np.sum((evr / evr.sum()) ** 2), 1e-30)
+    eff_rank = 1.0 / max(np.sum(evr_full ** 2), 1e-30)
 
     def _n_for(thr):
-        i = np.searchsorted(cumevr, thr)
-        return int(i) + 1 if i < len(cumevr) else len(cumevr)
+        i = int(np.searchsorted(np.cumsum(evr_full), thr))
+        return i + 1 if i < len(evr_full) else None
 
-    print(f"    Eff. rank = {eff_rank:.1f}")
-    print(f"    90% → {_n_for(0.90)} modes,  "
-          f"95% → {_n_for(0.95)},  99% → {_n_for(0.99)}")
+    def _fmt(n):
+        return f"{n}" if n is not None else "> N"
+
+    print(f"    Eff. rank = {eff_rank:.1f}  (full spectrum)")
+    print(f"    {k} modes retain {100 * cumevr[-1]:.3f}% of the total variance")
+    print(f"    90% -> {_fmt(_n_for(0.90))} modes,  "
+          f"95% -> {_fmt(_n_for(0.95))},  99% -> {_fmt(_n_for(0.99))}")
+    n99 = _n_for(0.99)
+    if n99 is not None and n99 > k:
+        print(f"    [WARN] k={k} is below n99={n99}: the stored basis does not "
+              f"reach 99% of the variance.")
 
     pod_info = {
         "V":          V.astype(np.float32),
         "u_pod_mean": u_mean.astype(np.float32),
         "evr":        evr.astype(np.float32),
         "cumevr":     cumevr.astype(np.float32),
+        "evr_full":   evr_full.astype(np.float32),
     }
     return C.astype(np.float32), pod_info
 
@@ -422,24 +531,54 @@ def apply_pod(U_raw, n_modes):
 # Input normalization
 # ======================================================================
 
-def normalize_currents(P, method="deviation"):
-    info = {"method": method}
+def normalize_currents(P, method="deviation", n_currents=None):
+    """Normalise the input matrix, treating currents and geometry separately.
+
+    ``P`` holds the ``n_currents`` anode currents first and, for the geometry
+    extension, any further design columns -- (ACD, immersion) -- after them.
+    The two blocks must not be normalised together, and the ``deviation`` rule
+    is where that bites: it divides each row by that row's own mean over *all*
+    columns, so geometry columns of order 1e-1 m swept in among currents of
+    order 2e4 A would corrupt the row mean and then be divided by it, damaging
+    both blocks at once.  The geometry block is z-scored over the dataset
+    instead, which also neutralises the scale mismatch between the two design
+    axes (s/d = 4.6 at nominal).
+
+    ``n_currents`` defaults to ``N_ANODES``; pass it explicitly only if the
+    current block is ever a different width.
+    """
+    nc = N_ANODES if n_currents is None else int(n_currents)
+    if P.shape[1] < nc:
+        raise ValueError("P has %d columns, fewer than the %d current columns"
+                         % (P.shape[1], nc))
+    Pc, Pg = P[:, :nc], P[:, nc:]
+    n_geom = Pg.shape[1]
+    info = {"method": method, "n_currents": nc, "n_geom": n_geom}
+
     if method == "none":
-        info["p_mean"] = np.zeros(N_ANODES, dtype=np.float32)
-        info["p_std"]  = np.ones(N_ANODES,  dtype=np.float32)
-        return P.copy(), info
-    if method == "deviation":
-        I_per_sample = P.mean(axis=1, keepdims=True)
-        P_norm = ((P - I_per_sample) / I_per_sample).astype(np.float32)
-        info["p_mean"] = np.zeros(N_ANODES, dtype=np.float32)
-        info["p_std"]  = np.ones(N_ANODES,  dtype=np.float32)
-        info["I_mean_global"] = float(P.mean())
-        return P_norm, info
-    p_mean = P.mean(axis=0).astype(np.float32)
-    p_std  = (P.std(axis=0) + 1e-9).astype(np.float32)
-    P_norm = ((P - p_mean) / p_std).astype(np.float32)
-    info["p_mean"], info["p_std"] = p_mean, p_std
-    return P_norm, info
+        Cn = Pc.copy()
+        info["p_mean"] = np.zeros(nc, dtype=np.float32)
+        info["p_std"]  = np.ones(nc,  dtype=np.float32)
+    elif method == "deviation":
+        I_per_sample = Pc.mean(axis=1, keepdims=True)       # currents only
+        Cn = ((Pc - I_per_sample) / I_per_sample).astype(np.float32)
+        info["p_mean"] = np.zeros(nc, dtype=np.float32)
+        info["p_std"]  = np.ones(nc,  dtype=np.float32)
+        info["I_mean_global"] = float(Pc.mean())
+    else:
+        p_mean = Pc.mean(axis=0).astype(np.float32)
+        p_std  = (Pc.std(axis=0) + 1e-9).astype(np.float32)
+        Cn = ((Pc - p_mean) / p_std).astype(np.float32)
+        info["p_mean"], info["p_std"] = p_mean, p_std
+
+    if n_geom == 0:
+        return Cn.astype(np.float32), info
+
+    g_mean = Pg.mean(axis=0).astype(np.float32)
+    g_std  = (Pg.std(axis=0) + 1e-9).astype(np.float32)
+    Gn = ((Pg - g_mean) / g_std).astype(np.float32)
+    info["g_mean"], info["g_std"] = g_mean, g_std
+    return np.concatenate([Cn, Gn], axis=1).astype(np.float32), info
 
 
 # ======================================================================
@@ -481,8 +620,32 @@ def _infer_mode(currents, dead_thresh=500.0):
 
 
 def stratified_split(N, run_names, ratios, manifest_path=None,
-                     P=None, dead_thresh=500.0, seed=42):
+                     P=None, dead_thresh=500.0, seed=42, train_modes=None,
+                     geom_ids=None, test_geoms=None):
+    """Split rows into train/val/test, stratified by campaign regime.
+
+    ``train_modes``, if given, restricts which regimes may enter train/val;
+    every run of any other regime is routed wholesale to test.  Because
+    ``apply_pod`` is called afterwards with ``fit_idx=train_idx``, this also
+    restricts the POD basis, the POD mean and the target statistics to those
+    regimes -- which is the point: it measures what a model fitted on the
+    normal operating envelope alone does on the fault regimes.
+
+    ``test_geoms`` does the same for geometry, and for the geometry extension
+    it is not optional.  Scattering the runs of one geometry across train and
+    test measures interpolation between neighbouring current vectors at a
+    geometry the model has already seen, and reports it as generalisation to a
+    new cell.  Holding out whole geometries is the only honest measure, and as
+    above it also keeps the held-out geometries out of the POD basis, which
+    scattering would not.  ``geom_ids`` is the per-run geometry label; runs
+    whose label is in ``test_geoms`` go to test entire.
+    """
     rng = np.random.default_rng(seed)
+    held_geom = set()
+    if test_geoms:
+        if geom_ids is None:
+            raise ValueError("test_geoms given without geom_ids")
+        held_geom = {i for i in range(N) if geom_ids[i] in set(test_geoms)}
     if manifest_path:
         f2m = _load_manifest_modes(manifest_path)
         modes = [f2m.get(n, "unknown") for n in run_names]
@@ -497,10 +660,27 @@ def stratified_split(N, run_names, ratios, manifest_path=None,
 
     train_all, val_all, test_all = [], [], []
     print("\n  Stratified split:")
+    if train_modes:
+        print(f"    (train/val restricted to: {', '.join(sorted(train_modes))})")
+    if held_geom:
+        print(f"    (held-out geometries: {', '.join(sorted(set(test_geoms)))}"
+              f" -- {len(held_geom)} runs to test)")
     for mode in sorted(groups):
-        idx = np.array(groups[mode])
+        idx = np.array([i for i in groups[mode] if i not in held_geom])
+        n_held = len(groups[mode]) - len(idx)
+        if n_held:
+            test_all.extend(i for i in groups[mode] if i in held_geom)
+        if len(idx) == 0:
+            print(f"    {mode:12s}: {n_held:4d} -> all test (held-out geometry)")
+            continue
         n = len(idx)
         rng.shuffle(idx)
+        # Checked BEFORE the n < 3 branch below, which would otherwise
+        # force a singleton regime (e.g. `uniform`) into train and leak it.
+        if train_modes and mode not in train_modes:
+            test_all.extend(idx)
+            print(f"    {mode:12s}: {n:4d} → all test (held-out regime)")
+            continue
         if n < 3:
             train_all.extend(idx)
             print(f"    {mode:12s}: {n:4d} → all train")
@@ -512,7 +692,8 @@ def stratified_split(N, run_names, ratios, manifest_path=None,
         train_all.extend(idx[:nt])
         val_all.extend(idx[nt:nt + nv])
         test_all.extend(idx[nt + nv:])
-        print(f"    {mode:12s}: {n:4d} → train={nt}, val={nv}, test={ne}")
+        extra = f" (+{n_held} held-out geometry)" if n_held else ""
+        print(f"    {mode:12s}: {n:4d} → train={nt}, val={nv}, test={ne}{extra}")
 
     return np.sort(train_all), np.sort(val_all), np.sort(test_all), modes
 
@@ -548,7 +729,7 @@ def _write_fluid_mesh_info(recon_group):
 def write_h5(path, P, U, x_grid, train_idx, val_idx, test_idx,
              norm_info, mapping, modes, u_ref, field_shape,
              delta_learning, pod_reduction, reference_run,
-             M_field, pod_info=None):
+             M_field, pod_info=None, run_names=None):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     U_train = U[train_idx]
@@ -585,6 +766,8 @@ def write_h5(path, P, U, x_grid, train_idx, val_idx, test_idx,
             r.create_dataset("u_pod_mean", data=pod_info["u_pod_mean"])
             r.create_dataset("evr",        data=pod_info["evr"])
             r.create_dataset("cumevr",     data=pod_info["cumevr"])
+            if "evr_full" in pod_info:
+                r.create_dataset("evr_full", data=pod_info["evr_full"])
 
         dt = h5py.string_dtype()
         for name, idx in [("train", train_idx), ("val", val_idx),
@@ -594,6 +777,12 @@ def write_h5(path, P, U, x_grid, train_idx, val_idx, test_idx,
             g.create_dataset("U", data=U[idx], compression="gzip")
             g.create_dataset("modes",
                              data=[modes[i] for i in idx], dtype=dt)
+            # The run name is the only key back to master_ml.h5 and to the
+            # solver's own scalars; without it a predicted field cannot be
+            # joined to anything outside this file.
+            if run_names is not None:
+                g.create_dataset("run_id",
+                                 data=[run_names[i] for i in idx], dtype=dt)
             print(f"  {name}: {len(idx)} samples")
 
     print(f"\nSaved → {path}")
@@ -635,8 +824,17 @@ def main():
                     default=[0.75, 0.15, 0.10])
     ap.add_argument("--input-norm",    default="deviation",
                     choices=["standard", "deviation", "none"])
-    ap.add_argument("--interface-res", type=int, default=64)
+    ap.add_argument("--interface-res", type=int, default=0,
+                    help="0 (default): learn the interface on its native "
+                         "mesh. A positive value resamples onto that many "
+                         "points per side, which discards ~35%% of the "
+                         "elevation range; legacy only.")
     ap.add_argument("--seed",          type=int, default=42)
+    ap.add_argument("--train-modes",   nargs="+", default=None,
+                    help="restrict train/val to these campaign regimes; every "
+                         "run of any other regime is routed to test. Also "
+                         "restricts the POD basis, since it is fitted on "
+                         "train_idx only.")
     args = ap.parse_args()
 
     ratios = tuple(args.split)
@@ -670,10 +868,22 @@ def main():
 
     M_field = U_raw.shape[1]
 
-    # ── Optional POD reduction ──
+    # ── Normalize inputs ──
+    P_norm, norm_info = normalize_currents(P, method=args.input_norm)
+
+    # ── Stratified split (also assigns the campaign mode of every row) ──
+    # Done BEFORE the POD so the basis is fitted on training rows only.
+    train_idx, val_idx, test_idx, modes = stratified_split(
+        len(P_norm), kept_names, ratios,
+        manifest_path=args.manifest, P=P,
+        dead_thresh=args.dead_threshold, seed=args.seed,
+        train_modes=set(args.train_modes) if args.train_modes else None)
+
+    # ── Optional POD reduction (basis fitted on train_idx only) ──
     pod_info = None
     if args.pod:
-        U_target, pod_info = apply_pod(U_raw, args.n_modes)
+        U_target, pod_info = apply_pod(U_raw, args.n_modes,
+                                       fit_idx=train_idx)
     else:
         U_target = U_raw
         if M_field > 50_000:
@@ -682,21 +892,12 @@ def main():
             print(f"  --pod for faster training, or POD_MLP which does POD")
             print(f"  internally (but still loads full fields).\n")
 
-    # ── Normalize inputs ──
-    P_norm, norm_info = normalize_currents(P, method=args.input_norm)
-
-    # ── Stratified split (also assigns the campaign mode of every row) ──
-    train_idx, val_idx, test_idx, modes = stratified_split(
-        len(P_norm), kept_names, ratios,
-        manifest_path=args.manifest, P=P,
-        dead_thresh=args.dead_threshold, seed=args.seed)
-
     # ── Write ──
     write_h5(args.output, P_norm, U_target, x_grid,
              train_idx, val_idx, test_idx,
              norm_info, args.mapping, modes,
              u_ref, field_shape, args.delta, args.pod, ref_name,
-             M_field, pod_info)
+             M_field, pod_info, run_names=kept_names)
 
     # ── Sanity ──
     print(f"\n--- Sanity ---")

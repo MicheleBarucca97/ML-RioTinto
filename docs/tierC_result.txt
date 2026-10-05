@@ -1,0 +1,6 @@
+=== Tier C: horizontal current in the metal (644160 elements) ===
+truth = T2 (functional on the true full-resolution P0 field)
+scalar         cls   |   (i)lin (ii)quad | (iii)fld  (iv)net | T3 floor
+--------------------------------------------------------------------------
+j_horiz_frac   L1    |   -0.107    0.912 |    1.000    0.982 |    1.000
+j_horiz_max    Linf  |   -0.257    0.458 |    0.998    0.984 |    1.000

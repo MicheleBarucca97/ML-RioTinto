@@ -1,36 +1,62 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-
-# Virtual environment
-ml-env/
-venv/
-env/
-
-# Data and models (too large for git)
+# ---------------------------------------------------------------------------
+# Generated. Reproducible from what is versioned, so never committed.
+#   data/    prepared HDF5 datasets   (prepare_alucell.py)
+#   models/  checkpoints              (train.py)
+#   plots/   figures                  (evaluate.py)
+#   logs/    training logs
+#   results/ analysis outputs
+# ---------------------------------------------------------------------------
 data/
 models/
 plots/
-alu_data/
 logs/
-*.run
-*.pth
+results/
+__pycache__/
+*.py[cod]
+
+# Environments
+ml-env/
+venv/
+env/
+.venv/
+
+# Large binaries that must never enter history
 *.h5
+*.pth
 *.ckpt
 *.weights
+*.msh
+*.mesh
+*.zip
+dbfile_*
+ASCII_*
 
-# Results/logs
-*.txt
-*.log
+# Alucell run directories: solver inputs and outputs, kept outside the repo.
+# See docs/RUNS.md for where they live.
+g[0-9][0-9]/
+alumina_*/
 
-#images
-*.png
+# LaTeX build products. The .tex and the .pdf are versioned; the rest is not.
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.bbl
+docs/*.blg
+docs/*.run.xml
+docs/*.bcf
+docs/*.synctex.gz
 
-# OS files
+# Editor and OS
 .DS_Store
 Thumbs.db
-to_read/
-results/
+*.swp
+
+# Manual backups are what git is for. Ignored so stragglers never return.
+*.bak
+*.bak_*
+*.bak[0-9]*
+
+# Assistant tooling and working notes. Local only, never pushed.
+CLAUDE.md
+.claude/

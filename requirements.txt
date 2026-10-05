@@ -1,0 +1,14 @@
+# Pinned from the environment the reported results were produced in.
+# Python 3.12.2
+h5py==3.13.0
+matplotlib==3.10.1
+numpy==2.0.2
+pandas==2.2.3
+# pyvista  (version not resolved)
+scipy==1.15.2
+torch==2.6.0
+# torch_geometric  (version not resolved)
+tqdm==4.67.1
+PyYAML==6.0.2
+# pyvista and torch_geometric are used by some scripts and are not
+# installed in the base environment; add them if you need those.

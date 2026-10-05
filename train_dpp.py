@@ -5,7 +5,7 @@ Compatible with all benchmarks (1-D, 3-D, and Alucell).
 
 Usage (single node, N GPUs)
 ---------------------------
-    torchrun --nproc_per_node=2 train_ddp.py --config config_alucell.yaml
+    torchrun --nproc_per_node=2 train_ddp.py --config configs/config_alucell.yaml
 
 Changes from the single-GPU train.py
 -------------------------------------

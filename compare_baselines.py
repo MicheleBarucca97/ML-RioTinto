@@ -15,8 +15,8 @@ This script removes the ambiguity: same test runs, same three metrics, three
 predictors.  It needs no retraining — the two regressions take seconds and the
 network only runs inference.
 
-    python compare_baselines.py --config config_alucell.yaml
-    python compare_baselines.py --config config_alucell.yaml --model models/best_model_ResFFNN.pth
+    python compare_baselines.py --config configs/config_alucell.yaml
+    python compare_baselines.py --config configs/config_alucell.yaml --model models/best_model_ResFFNN.pth
 
 What to conclude
 ----------------
@@ -47,7 +47,15 @@ from utils import build_model, resolve_checkpoint
 #: currents sum to a fixed total, so the design matrix is exactly rank
 #: deficient; keeping that direction inverts numerical noise and produces huge,
 #: meaningless coefficients (predictions barely change, but the fit is junk).
-_RCOND = 1e-6
+#:
+#: The threshold must exceed the reciprocal of the condition number or it
+#: truncates nothing.  On the 3-D dataset the spectrum of the 938 x 24 design
+#: runs 1.47 ... 0.77 and then drops to 4.9e-6, i.e. 3.3e-6 relative, so the
+#: former value of 1e-6 kept the null direction and let ||beta||_F reach
+#: 1.6e5 instead of 15 -- with 100% of the excess along the all-ones vector.
+#: 1e-4 sits two decades above the null value and three below the smallest
+#: genuine one.
+_RCOND = 1e-4
 
 
 def _pairwise(Z):

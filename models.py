@@ -640,7 +640,25 @@ class DeepSetsCoordinateNet(nn.Module):
         return self.head(h).squeeze(-1)                      # [B, M]
 
 
-import torch_geometric.nn as pyg_nn
+try:
+    import torch_geometric.nn as pyg_nn
+except ModuleNotFoundError:                 # optional: only MeshGraphNet needs it
+    class _MissingPyG:
+        """Stand-in so MeshGraphNet can still be *defined* without the package.
+
+        Importing models.py must not fail because one optional dependency for
+        one architecture is absent; only instantiating that architecture does,
+        and it says what to install.
+        """
+
+        class MessagePassing(nn.Module):
+            def __init__(self, *args, **kwargs):
+                raise ImportError(
+                    "MeshGraphNet requires torch_geometric "
+                    "(pip install torch_geometric)"
+                )
+
+    pyg_nn = _MissingPyG
 
 # ---------------------------------------------------------------------------
 # Graph Neural Network (GNN / MeshGraphNet)

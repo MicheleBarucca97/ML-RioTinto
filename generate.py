@@ -6,9 +6,9 @@ appropriate generator in the benchmarks/ package.
 
 Usage
 -----
-    python generate.py --config config_1d.yaml
-    python generate.py --config config_3d.yaml
-    python generate.py --config config_1d.yaml --plot
+    python generate.py --config configs/config_1d.yaml
+    python generate.py --config configs/config_3d.yaml
+    python generate.py --config configs/config_1d.yaml --plot
 """
 
 import argparse
