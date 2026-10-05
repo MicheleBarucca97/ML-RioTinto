@@ -1,0 +1,1198 @@
+#----------------------------------------------------------------------
+# File : _mesh.mac
+#
+# Author : Team EPFL + YcoorSystem + B. BARDET + S. RENAUDIER
+# Date   : 06 / 10 / 2009
+#
+# Description : Create a mesh of the generic cell with ALUCELL.
+#
+# Alucell Version  >= 2009.0
+#
+#----------------------------------------------------------------------
+## |  |  Structured Mesh generated with ALUCELL
+
+#----------------------------------------------------------------------
+# Intermediate parameters calculated from _geometrical_params.mac
+
+#----------------------------------------------------------------------
+# Dimensions
+#----------------------------------------------------------------------
+  (bloc_height = bloc_height_real - bar_height -cast_iron_z)
+  (bloc_width  = bloc_width_real*(3-n_bar_per_bloc))
+
+IF(eq(n_bar_per_bloc,1))THEN
+  (dist_bar_to_bar = bloc_width/2)
+ENDIF
+
+#----------------------------------------------------------------------
+# Plan size composed by the bottom of anodes and surrounding bath
+  (h_liquide = metal_height + ACD)
+  (Lx_ano = n_blocs*bloc_width_real + 2*h_liquide/tan(alpha_x))
+  (Ly_ano = 2*bloc_length + 2*h_liquide/tan(alpha_y))
+
+#----------------------------------------------------------------------
+# Discretisation
+#----------------------------------------------------------------------
+# Mesh size
+
+# Anode discretisation : vertical
+ (Nano_Z      = NLcanal)      # Nb of layers along z for anode under the bath + above
+ (Nano_Z_2    = NLanodes)
+ (Nano_Z_Beam = 2)            # Nb of layers for the beam (if no CAO)
+
+# Anode discretisation : horizontal
+ IF(CAO)THEN
+	 (Nano_X    = max( int(anode_width /hx)                 ,2) )
+	 (Nano_Y    = 16 )
+ ELSE
+	 (Nano_X    = max( int(anode_width /hx)                 ,2) )
+	 (Nano_Y    = max( int(anode_length/hy)                 ,2) )
+ ENDIF
+
+ (Nbain_Y_0 = max( int(cent_chan_width/hy)              ,3) )
+
+ (Nbain_X_2 = 2 )
+ (Nbain_Y_2 = max( int(Ly_ano/2/hy -cent_chan_width/hy -anode_length/hy ),3) )
+ (Nbain_X_3 = 3 ) # doit etre impair
+
+# Cathode discretisation : vertical
+ (n_bar_height     = NLbars)
+ (n_cathode_height = NLcath)
+
+# Cathode discretisation : horizontal
+ (n_bar_width                   = max( int(bar_width /hx)                                               , 2) )
+ (n_cathode_between_bar_centre  = max( int(dist_bar_to_bar /hx / 2 - bar_width /hx / 2)                 , 1) )
+ (n_cathode_between_bar_end   = max(int((bloc_width_real/2 - dist_bar_to_bar/2 - bar_width/2 -cast_iron_x)/hx),2))
+
+# Counting the Nb of elements
+  IF(eq(n_bar_per_bloc,2))THEN
+   (Nx_2 = 2*n_blocs*( n_bar_width + n_cathode_between_bar_centre + n_cathode_between_bar_end))
+ ELSE
+   (Nx_2 = n_blocs*( n_bar_width + n_cathode_between_bar_centre + n_cathode_between_bar_end))
+ ENDIF
+
+# Setting the appropriate anode subdivision to be sure of having same discretization at anode and cathode
+ (Nano_X = int((Nx_2 - (Nbain_X_2*(n_anodes-1)+ 2))/n_anodes))
+ (Ny = Nano_Y+Nbain_Y_0+Nbain_Y_2)
+
+ (n_bar_centre = max( int(bar_centre_dist /hy)           ,1) )
+ (n_bar_length = Ny - n_bar_centre - Nbain_Y_2)
+
+ # Recounting the Nb of elements
+ (Nxcat = Nx_2 + (Nbain_X_3-1)*2)
+ (Nxan  = Nano_X*n_anodes+Nbain_X_2*(n_anodes-1)+2*Nbain_X_3)
+
+## |  |  |  Mesh along y  INT_Ny _TNI
+## |  |  |  Mesh along x comparison : INT_Nxcat _TNI and INT_Nxan _TNI
+
+#----------------------------------------------------------------------
+# If needed geometric ratio factors can be defined before each command :
+# joint, hexa, bar ...
+#----------------------------------------------------------------------
+ (struct_rx =1)
+ (struct_ry =1)
+ (struct_rz =1)
+
+#----------------------------------------------------------------------
+# IF CAO = 1
+#----------------------------------------------------------------------
+
+IF(CAO)THEN
+	_mesh_CAO.mac()
+ENDIF
+
+#----------------------------------------------------------------------
+#        Meshing of : Anode + bath + beam (beam, if CAO = 0)
+#----------------------------------------------------------------------
+# Reference intermediate defintions
+ (refbars  = ns3d_matbars   )
+ (refcath  = ns3d_matcathode)
+ (refalu   = ns3d_matalu    )
+ (refbain  = ns3d_matele    )
+ (refanode = ns3d_matanode  )
+ (refbeam  = ns3d_matbeam   )
+
+ (reftop   = ns3d_matcastiron_top)
+ (refside  = ns3d_matcastiron_side)
+ (refins   = ns3d_matinsulating)
+
+ # Hexaedral Mesh
+ mesh
+  # Use of Mstruct3d :
+  #            |   -x ;    x ;   Nx  ;   -y  ;     y ;    Ny   ;    -z ;     z ;    Nz  ;   ref    ; mesh   |
+
+  # ===============================================
+  # Anode
+  # ===============================================
+
+  (pos_X_anode_1 = -anode_dx*(n_anodes-1)/2)
+  (h_ano_1 = metal_height + ACD)
+  (h_ano_2 = metal_height + bath_height)
+  (h_ano_3 = metal_height + ACD + anode_height)
+  Mstruct3d.mac( pos_X_anode_1 - anode_width / 2; pos_X_anode_1 + anode_width / 2  ; Nano_X ; -cent_chan_width  ; -cent_chan_width - anode_length ; Nano_Y ; h_ano_1 ; h_ano_2 ; Nano_Z ; refanode  ; anode_1_1  )
+  Mstruct3d.mac( pos_X_anode_1 - anode_width / 2; pos_X_anode_1 + anode_width / 2  ; Nano_X ; -cent_chan_width  ; -cent_chan_width - anode_length ; Nano_Y ; h_ano_2 ; h_ano_3 ; Nano_Z_2 ; refanode  ; anode_1_2  )
+
+  # Bath around anodes
+  (pos_X_bain_1 = pos_X_anode_1 + anode_width / 2)
+  (dx_bain_1 = anode_dx - anode_width)
+
+  Mstruct3d.mac( pos_X_anode_1 - anode_width / 2; pos_X_anode_1 + anode_width / 2  ; Nano_X  ; 0  ; -cent_chan_width ; Nbain_Y_0 ; h_ano_1 ; h_ano_2 ; Nano_Z ; refbain  ; bain_2_0 )
+
+#----------------------------------------------------------------------
+# IF with side bath channels
+#----------------------------------------------------------------------
+
+  Mstruct3d.mac( pos_X_bain_1; pos_X_bain_1 + dx_bain_1  ; Nbain_X_2 ; 0  ; -cent_chan_width ; Nbain_Y_0 ; h_ano_1 ; h_ano_2 ; Nano_Z ; refbain  ; bain_1_0 )
+
+  Mstruct3d.mac( pos_X_bain_1; pos_X_bain_1 + dx_bain_1 ; Nbain_X_2 ; -cent_chan_width  ; -cent_chan_width - anode_length ; Nano_Y ; h_ano_1 ; h_ano_2 ; Nano_Z ; refbain  ; bain_1_1 )
+
+  Mstruct3d.mac( pos_X_bain_1; pos_X_bain_1 + dx_bain_1 ; Nbain_X_2 ; -cent_chan_width - anode_length  ; -Ly_ano/2 ; Nbain_Y_2 ; h_ano_1 ; h_ano_2 ; Nano_Z ; refbain  ; bain_1_2 )
+
+  Mstruct3d.mac( pos_X_anode_1 - anode_width / 2; pos_X_anode_1 + anode_width / 2  ; Nano_X  ; -cent_chan_width - anode_length  ; -Ly_ano/2 ; Nbain_Y_2 ; h_ano_1 ; h_ano_2 ; Nano_Z ; refbain  ; bain_2_2 )
+
+  Mstruct3d.mac( -Lx_ano/2; pos_X_anode_1 - anode_width / 2 ; Nbain_X_3 ; 0  ; -cent_chan_width ; Nbain_Y_0 ; h_ano_1 ; h_ano_2 ; Nano_Z ; refbain  ; bain_3_0 )
+
+  Mstruct3d.mac( -Lx_ano/2; pos_X_anode_1 - anode_width / 2  ; Nbain_X_3 ; -cent_chan_width  ; -cent_chan_width - anode_length ; Nano_Y ; h_ano_1 ; h_ano_2 ; Nano_Z ; refbain  ; bain_3_1 )
+
+  Mstruct3d.mac( -Lx_ano/2; pos_X_anode_1 - anode_width / 2  ; Nbain_X_3 ; -cent_chan_width - anode_length  ; -Ly_ano/2 ; Nbain_Y_2 ; h_ano_1 ; h_ano_2 ; Nano_Z ; refbain  ; bain_3_2 )
+
+  # Anode Beam
+  IFENABLED(rm_anode_beam)THEN
+    # Nothing to do
+  ELSE
+    IF(CAO)THEN
+      # Nothing to do
+    ELSE
+      Mstruct3d.mac( pos_X_bain_1; pos_X_bain_1 + dx_bain_1 ; Nbain_X_2 ; -cent_chan_width  ; -cent_chan_width - anode_length ; Nano_Y ; h_ano_3 ; h_ano_3 + beam_height  ; Nano_Z_Beam ; refbeam  ; Beam_1_1 )
+      Mstruct3d.mac( pos_X_anode_1 - anode_width / 2; pos_X_anode_1 + anode_width / 2  ; Nano_X ; -cent_chan_width  ; -cent_chan_width - anode_length ; Nano_Y ; h_ano_3 ; h_ano_3 + beam_height ; Nano_Z_Beam ; refbeam  ; Beam_2_1  )
+      Mstruct3d.mac( pos_X_anode_1 - anode_width / 2; pos_X_anode_1 + anode_width / 2  ; Nano_X  ; 0  ; -cent_chan_width ; Nbain_Y_0 ; h_ano_3 ; h_ano_3 + beam_height ; Nano_Z_Beam ; refbeam  ; Beam_2_0 )
+    ENDIF
+  ENDIF
+
+  #-------------------------------------------
+  # Merging & duplication
+  #-------------------------------------------
+
+  # Anodes
+   Mmerge_mesh.mac( meshanode_001 ; 8)
+     Mmerge_mesh_sub.mac( anode_1_1  ; ID )
+     Mmerge_mesh_sub.mac( anode_1_1  ; SYM_Y )
+     Mmerge_mesh_sub.mac( anode_1_2  ; ID )
+     Mmerge_mesh_sub.mac( anode_1_2  ; SYM_Y )
+   end
+
+   FOR k=2 TO n_anodes DO("cycle_joint_anode_tr")
+     (tr_x = anode_dx*(k-1))
+     Mtransl.mac(meshanode_#1; tr_x; 0;0;meshanode_#k)
+   ENDDO("cycle_joint_anode_tr")
+
+   Mmerge_mesh.mac( meshanode ; 8)
+     FOR k=1 TO n_anodes DO("cycle_joint_anode")
+       Mmerge_mesh_sub.mac( meshanode_#k ;ID)
+     ENDDO("cycle_joint_anode")
+   end
+
+  # Bath
+
+   Mmerge_mesh.mac( meshbain_001 ; 8)
+     Mmerge_mesh_sub.mac( bain_1_0  ; ID    )
+     Mmerge_mesh_sub.mac( bain_1_0  ; SYM_Y )
+     Mmerge_mesh_sub.mac( bain_1_1  ; ID    )
+     Mmerge_mesh_sub.mac( bain_1_1  ; SYM_Y )
+     Mmerge_mesh_sub.mac( bain_1_2  ; ID    )
+     Mmerge_mesh_sub.mac( bain_1_2  ; SYM_Y )
+     Mmerge_mesh_sub.mac( bain_2_0  ; ID    )
+     Mmerge_mesh_sub.mac( bain_2_0  ; SYM_Y )
+     Mmerge_mesh_sub.mac( bain_2_2  ; ID    )
+     Mmerge_mesh_sub.mac( bain_2_2  ; SYM_Y )
+   end
+
+   FOR k=2 TO n_anodes-1 DO("cycle_joint_bath_tr")
+     (tr_x = anode_dx*(k-1))
+     Mtransl.mac(meshbain_#1; tr_x; 0;0;meshbain_#k)
+   ENDDO("cycle_joint_bath_tr")
+
+   Mmerge_mesh.mac( meshbain ; 8)
+     FOR k=1 TO n_anodes-1 DO("cycle_joint_bath")
+       Mmerge_mesh_sub.mac( meshbain_#k ;ID)
+     ENDDO("cycle_joint_bath")
+     Mmerge_mesh_sub.mac( bain_2_0  ; SYM_X  )
+     Mmerge_mesh_sub.mac( bain_2_0  ; SYM_XY )
+     Mmerge_mesh_sub.mac( bain_3_0  ; ID     )
+     Mmerge_mesh_sub.mac( bain_3_0  ; SYM_Y  )
+     Mmerge_mesh_sub.mac( bain_3_0  ; SYM_X  )
+     Mmerge_mesh_sub.mac( bain_3_0  ; SYM_XY )
+     Mmerge_mesh_sub.mac( bain_2_2  ; SYM_X  )
+     Mmerge_mesh_sub.mac( bain_2_2  ; SYM_XY )
+     Mmerge_mesh_sub.mac( bain_3_1  ; ID     )
+     Mmerge_mesh_sub.mac( bain_3_1  ; SYM_Y  )
+     Mmerge_mesh_sub.mac( bain_3_2  ; ID     )
+     Mmerge_mesh_sub.mac( bain_3_2  ; SYM_Y  )
+     Mmerge_mesh_sub.mac( bain_3_1  ; SYM_X  )
+     Mmerge_mesh_sub.mac( bain_3_1  ; SYM_XY )
+     Mmerge_mesh_sub.mac( bain_3_2  ; SYM_X  )
+     Mmerge_mesh_sub.mac( bain_3_2  ; SYM_XY )
+   end
+
+  # Beam
+  IFENABLED(rm_anode_beam)THEN
+    # Nothing to do
+  ELSE
+    IF(eq(CAO,0))THEN
+	   Mmerge_mesh.mac( meshbeam_001 ; 8)
+	     Mmerge_mesh_sub.mac( Beam_1_1  ; ID )
+	     Mmerge_mesh_sub.mac( Beam_1_1  ; SYM_Y )
+	     Mmerge_mesh_sub.mac( Beam_2_1  ; ID )
+	     Mmerge_mesh_sub.mac( Beam_2_1  ; SYM_Y )
+	   end
+
+	   FOR k=2 TO n_anodes-1 DO("cycle_joint_beam_tr")
+	     (tr_x = anode_dx*(k-1))
+	     Mtransl.mac(meshbeam_#1; tr_x; 0;0;meshbeam_#k)
+	   ENDDO("cycle_joint_beam_tr")
+	
+	   Mmerge_mesh.mac( meshbeam ; 8)
+		   FOR k=1 TO n_anodes-1 DO("cycle_joint_beam")
+			Mmerge_mesh_sub.mac( meshbeam_#k ;ID)
+		   ENDDO("cycle_joint_beam")
+		   Mmerge_mesh_sub.mac( Beam_2_0  ; ID     )
+		   Mmerge_mesh_sub.mac( Beam_2_0  ; SYM_Y  )
+		   Mmerge_mesh_sub.mac( Beam_2_0  ; SYM_X  )
+		   Mmerge_mesh_sub.mac( Beam_2_0  ; SYM_XY )
+		   Mmerge_mesh_sub.mac( Beam_2_1  ; SYM_X  )
+		   Mmerge_mesh_sub.mac( Beam_2_1  ; SYM_XY )
+	   end
+    ENDIF
+  ENDIF
+
+  # ===============================================
+  # INTERFACE
+  # ===============================================
+  (cx = geom_x_z0/geom_x_zp1)
+  (cy = geom_y_z0/geom_y_zp1)
+
+  (x1 = pos_X_anode_1 - anode_width / 2)
+  (x2 = pos_X_anode_1 + anode_width / 2)
+  (nx = Nano_X)
+  (y1 = cent_chan_width)
+  (y2 = cent_chan_width + anode_length)
+  (ny = Nano_Y)
+  (z = 0)
+  Mstruct2d.mac(cx*x1;cx*x2;nx;cy*y1;cy*y2;ny;z;intA_1)
+
+  (x1 = pos_X_anode_1 - anode_width / 2)
+  (x2 = pos_X_anode_1 + anode_width / 2)
+  (nx = Nano_X)
+  (y1 = 0)
+  (y2 = cent_chan_width)
+  (ny = Nbain_Y_0)
+  Mstruct2d.mac(cx*x1;cx*x2;nx;cy*y1;cy*y2;ny;z;intB_0)
+
+  # Bath around anodes
+  (pos_X_bain_1 = pos_X_anode_1 + anode_width / 2)
+  (dx_bain_1 = anode_dx - anode_width)
+
+#----------------------------------------------------------------------
+# IF with side bath channels
+#----------------------------------------------------------------------
+
+  (x1 = pos_X_bain_1)
+  (x2 = pos_X_bain_1 + dx_bain_1)
+  (nx = Nbain_X_2)
+  (y1 =  cent_chan_width)
+  (y2 =  cent_chan_width + anode_length)
+  (ny = Nano_Y)
+  Mstruct2d.mac(cx*x1;cx*x2;nx;cy*y1;cy*y2;ny;z;intB_1)
+
+  (x1 = pos_X_bain_1)
+  (x2 = pos_X_bain_1 + dx_bain_1)
+  (nx = Nbain_X_2)
+  (y2 = 0)
+  (y1 = cent_chan_width)
+  (ny = Nbain_Y_0)
+  Mstruct2d.mac(cx*x1;cx*x2;nx;cy*y1;cy*y2;ny;z;intB_2)
+
+  (x1 = pos_X_bain_1)
+  (x2 = pos_X_bain_1 + dx_bain_1)
+  (nx = Nbain_X_2)
+  (y1 = cent_chan_width + anode_length)
+  (y2 = Ly_ano/2)
+  (ny = Nbain_Y_2)
+  Mstruct2d.mac(cx*x1;cx*x2;nx;cy*y1;cy*y2;ny;z;intB_3)
+
+  (x1 = pos_X_anode_1 - anode_width / 2)
+  (x2 = pos_X_anode_1 + anode_width / 2)
+  (nx = Nano_X)
+  (y1 = cent_chan_width + anode_length)
+  (y2 = Ly_ano/2)
+  (ny = Nbain_Y_2)
+  Mstruct2d.mac(cx*x1;cx*x2;nx;cy*y1;cy*y2;ny;z;intB_4)
+
+  (x1 = -Lx_ano/2)
+  (x2 = pos_X_anode_1 - anode_width / 2)
+  (nx = Nbain_X_3)
+  (y1 = 0)
+  (y2 = cent_chan_width)
+  (ny = Nbain_Y_0)
+  Mstruct2d.mac(cx*x1;cx*x2;nx;cy*y1;cy*y2;ny;z;intB_5)
+
+  (x1 = -Lx_ano/2)
+  (x2 = pos_X_anode_1 - anode_width / 2)
+  (nx = Nbain_X_3)
+  (y1 = cent_chan_width)
+  (y2 = cent_chan_width + anode_length)
+  (ny = Nano_Y)
+  Mstruct2d.mac(cx*x1;cx*x2;nx;cy*y1;cy*y2;ny;z;intB_6)
+
+  (x1 = -Lx_ano/2)
+  (x2 = pos_X_anode_1 - anode_width / 2)
+  (nx = Nbain_X_3)
+  (y1 = cent_chan_width + anode_length)
+  (y2 = Ly_ano/2)
+  (ny = Nbain_Y_2)
+  Mstruct2d.mac(cx*x1;cx*x2;nx;cy*y1;cy*y2;ny;z;intB_7)
+
+  #-------------------------------------------
+  # Merging & duplication
+  #-------------------------------------------
+
+  # Anodes
+   Mmerge_mesh.mac( interface_A_001 ; 4)
+     Mmerge_mesh_sub.mac( intA_1  ; ID )
+     Mmerge_mesh_sub.mac( intB_0  ; ID )
+   end
+
+   FOR k=2 TO n_anodes DO("cycle_joint_anode_tr")
+     (tr_x = anode_dx*(k-1))
+     Mtransl.mac(interface_A_#1; cx*tr_x; 0;0;interface_A_#k)
+   ENDDO("cycle_joint_anode_tr")
+
+   Mmerge_mesh.mac( interface_A ; 4)
+     FOR k=1 TO n_anodes DO("cycle_joint_anode")
+       Mmerge_mesh_sub.mac( interface_A_#k ;ID)
+     ENDDO("cycle_joint_anode")
+   end
+
+  # Bath
+
+   Mmerge_mesh.mac( interface_B_001 ; 4)
+     Mmerge_mesh_sub.mac( intB_1  ; ID )
+     Mmerge_mesh_sub.mac( intB_2  ; ID )
+     Mmerge_mesh_sub.mac( intB_3  ; ID )
+     Mmerge_mesh_sub.mac( intB_4  ; ID )
+   end
+
+   FOR k=2 TO n_anodes-1 DO("cycle_joint_bath_tr")
+     (tr_x = anode_dx*(k-1))
+     Mtransl.mac(interface_B_#1; cx*tr_x; 0;0;interface_B_#k)
+   ENDDO("cycle_joint_bath_tr")
+
+   Mmerge_mesh.mac( interface_B ; 4)
+     FOR k=1 TO n_anodes-1 DO("cycle_joint_bath")
+       Mmerge_mesh_sub.mac( interface_B_#k ;ID)
+     ENDDO("cycle_joint_bath")
+     Mmerge_mesh_sub.mac( intB_1  ; SYM_X  )
+     Mmerge_mesh_sub.mac( intB_4  ; SYM_X  )
+     Mmerge_mesh_sub.mac( intB_5  ; ID  )
+     Mmerge_mesh_sub.mac( intB_5  ; SYM_X  )
+     Mmerge_mesh_sub.mac( intB_6  ; ID  )
+     Mmerge_mesh_sub.mac( intB_6  ; SYM_X  )
+     Mmerge_mesh_sub.mac( intB_7  ; ID  )
+     Mmerge_mesh_sub.mac( intB_7  ; SYM_X  )
+   end
+
+   Mmerge_mesh.mac( interface_F ; 4)
+     Mmerge_mesh_sub.mac( interface_B  ; ID )
+     Mmerge_mesh_sub.mac( interface_A  ; ID )
+   end
+
+return
+
+IFENABLED(DEBUG)THEN
+  (ensight_name="debug_interface_F")
+  (ensight_format="formatted")
+  (interface_F_eltype="quad4")
+  ensight
+    add  interface_F_nodes
+  return
+ENDIF
+
+#=========================================================
+#---------------------------------------------------------
+#
+#              | --------------------- |
+#              | Cathodic bloc meshing |
+#              | --------------------- |
+#
+#---------------------------------------------------------
+#=========================================================
+mesh
+# ==============================
+# IMPLICIT Parameters definition
+# ==============================
+
+# ---------------------------------------------------
+# IF cathodic_bloc_config = 0, standard cathodic exit
+# ---------------------------------------------------
+
+ IF(eq(cathodic_bloc_config,0))THEN
+
+	 # number of elementary slice duplication
+	 # --------------------------------------
+
+	 (nb_slices = 5) 
+
+	 # -------------------------SLICE n°1---------------------------
+	 (k = 1                                                        )
+	 (jc_y_#k =  0                                                 )
+	 (jd_y_#k =  2*bar_centre_dist                                 )
+	 (ny_#k   =  2*n_bar_centre                                    )
+	 (k_bar_#k            = ns3d_matinsulating                     )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°2---------------------------
+	 (k = 2                                                        )
+	 (jc_y_#k = -bar_centre_dist - (bloc_length-bar_centre_dist-side_chan_width_y)/2 )
+	 (jd_y_#k =  bloc_length - bar_centre_dist - side_chan_width_y )
+	 (ny_#k   =  n_bar_length                                      )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°3---------------------------
+	 (k = 3                                                        )
+	 (jc_y_#k = -bloc_length+side_chan_width_y/2                   )
+	 (jd_y_#k =  side_chan_width_y                                 )
+	 (ny_#k   =  Nbain_Y_2                                         )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°4---------------------------
+	 (k = 4                                                        )
+	 (jc_y_#k = bar_centre_dist + (bloc_length-bar_centre_dist-side_chan_width_y)/2 )
+	 (jd_y_#k = bloc_length - bar_centre_dist - side_chan_width_y  )
+	 (ny_#k   = n_bar_length                                       )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°5---------------------------
+	 (k = 5                                                        )
+	 (jc_y_#k =  bloc_length-side_chan_width_y/2                   )
+	 (jd_y_#k =  side_chan_width_y                                 )
+	 (ny_#k   =  Nbain_Y_2                                         )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------------------------------------------
+
+	 # Cathodic bar outer part
+	 # -----------------------
+
+	 # -------------------------Upstream---------------------------
+	 (jc_x = -dist_bar_to_bar/2)  
+	 (jc_y = -bar_length/2 - bloc_length/2 )
+	 (jc_z = -bloc_height - bar_height/2 - cast_iron_z)
+	 (jd_x = bar_width)
+	 (jd_y = bar_length - bloc_length)
+	 (jd_z = bar_height)
+	 Mjoint.mac(j_up_bar;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;n_bar_width;3;n_bar_height;ns3d_matbars) 
+	 # ------------------------Downstream--------------------------
+	 (jc_y = bar_length/2 + bloc_length/2 )
+	 Mjoint.mac(j_dw_bar;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;n_bar_width;3;n_bar_height;ns3d_matbars)
+	 # ------------------------------------------------------------
+  ENDIF
+
+# -----------------------------------------------
+# IF cathodic_bloc_config = 1, bottom exit config
+# -----------------------------------------------
+
+ IF(eq(cathodic_bloc_config,1))THEN
+
+	 # number of elementary slice duplication
+	 # --------------------------------------
+
+	 (nb_slices = 9) 
+
+	 (n_bar_width_BE = max(int(bar_width_BE/hy),1)                 )
+	 (n_bar_l1 = int((Ny-n_bar_centre-n_bar_width_BE-Nbain_Y_2)/2)           )
+	 (n_bar_l2 = Ny-n_bar_centre-n_bar_width_BE-Nbain_Y_2 - n_bar_l1         )
+	 (l_quarter_bloc1 = 0.5*(bloc_length-bar_width_BE)-bar_centre_dist)
+	 (l_quarter_bloc2 = bloc_length-bar_centre_dist-bar_width_BE-side_chan_width_y-l_quarter_bloc1)
+
+	 # -------------------------SLICE n°1---------------------------
+	 (k = 1                                                        )
+	 (jc_y_#k =  0                                                 )
+	 (jd_y_#k =  2*bar_centre_dist                                 )
+	 (ny_#k   =  2*n_bar_centre                                    )
+	 (k_bar_#k            = ns3d_matinsulating                     )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°2---------------------------
+	 (k = 2                                                        )
+	 (jc_y_#k = -bar_centre_dist -l_quarter_bloc1 -bar_width_BE/2  )
+	 (jd_y_#k =  bar_width_BE                                      )
+	 (ny_#k   =  n_bar_width_BE                                    )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°3---------------------------
+	 (k = 3                                                        )
+	 (jc_y_#k = -bar_centre_dist -l_quarter_bloc1 -0.5*l_quarter_bloc2 -bar_width_BE )
+	 (jd_y_#k = l_quarter_bloc2                                     )
+	 (ny_#k   = n_bar_l1                                           )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°4---------------------------
+	 (k = 4                                                        )
+	 (jc_y_#k = -bar_centre_dist -l_quarter_bloc1/2                )
+	 (jd_y_#k = l_quarter_bloc1                                    )
+	 (ny_#k   = n_bar_l2                                           )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°5---------------------------
+	 (k = 5                                                        )
+	 (jc_y_#k = bar_centre_dist + l_quarter_bloc1 +bar_width_BE/2   )
+	 (jd_y_#k =  bar_width_BE                                      )
+	 (ny_#k   =  n_bar_width_BE                                    )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°6---------------------------
+	 (k = 6                                                        )
+	 (jc_y_#k = bar_centre_dist +l_quarter_bloc1 +0.5*l_quarter_bloc2 +bar_width_BE )
+	 (jd_y_#k = l_quarter_bloc2                                    )
+	 (ny_#k   = n_bar_l1                                           )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°7---------------------------
+	 (k = 7                                                        )
+	 (jc_y_#k = bar_centre_dist +l_quarter_bloc1/2                 )
+	 (jd_y_#k = l_quarter_bloc1                                    )
+	 (ny_#k   = n_bar_l2                                           )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°8---------------------------
+	 (k = 8                                                        )
+	 (jc_y_#k =  bloc_length-side_chan_width_y/2                   )
+	 (jd_y_#k =  side_chan_width_y                                 )
+	 (ny_#k   =  Nbain_Y_2                                         )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°9---------------------------
+	 (k = 9                                                        )
+	 (jc_y_#k =  -bloc_length+side_chan_width_y/2                   )
+	 (jd_y_#k =  side_chan_width_y                                 )
+	 (ny_#k   =  Nbain_Y_2                                         )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------------------------------------------
+
+
+	 # Cathodic bar outer part
+	 # -----------------------
+
+	 # -------------------------Upstream---------------------------
+	 (jc_x = -dist_bar_to_bar/2)  
+	 (jc_y = -bar_centre_dist -l_quarter_bloc1 -bar_width_BE/2 )
+	 (jc_z = -bloc_height - bar_height - cast_iron_z -bar_length_BE/2)
+	 (jd_x = bar_width)
+	 (jd_y = bar_width_BE)
+	 (jd_z = bar_length_BE)
+	 Mjoint.mac(j_up_bar;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;n_bar_width;n_bar_width_BE;3;ns3d_matbars) 
+	 # ------------------------Downstream--------------------------
+	 (jc_y = bar_centre_dist +l_quarter_bloc1 +bar_width_BE/2 )
+	 Mjoint.mac(j_dw_bar;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;n_bar_width;n_bar_width_BE;3;ns3d_matbars)
+	 # ------------------------------------------------------------
+  ENDIF
+
+# -----------------------------------------------------------------
+# IF cathodic_bloc_config = 2, mixed bottom exit / side exit config
+# -----------------------------------------------------------------
+
+ IF(eq(cathodic_bloc_config,2))THEN
+
+	 # number of elementary slice duplication
+	 # --------------------------------------
+
+	 (nb_slices = 9) 
+
+
+	 (n_bar_width_BE = max(int(bar_width_BE/hy),1)                 )
+	 (n_bar_l1 = int((Ny-n_bar_centre-n_bar_width_BE-Nbain_Y_2)/2)           )
+	 (n_bar_l2 = Ny-n_bar_centre-n_bar_width_BE-Nbain_Y_2 - n_bar_l1         )
+	 (l_quarter_bloc1 = 0.5*(bloc_length-bar_width_BE)-bar_centre_dist)
+	 (l_quarter_bloc2 = bloc_length-bar_centre_dist-bar_width_BE-side_chan_width_y-l_quarter_bloc1)
+
+	 # -------------------------SLICE n°1---------------------------
+	 (k = 1                                                        )
+	 (jc_y_#k =  0                                                 )
+	 (jd_y_#k =  2*bar_centre_dist                                 )
+	 (ny_#k   =  2*n_bar_centre                                    )
+	 (k_bar_#k            = ns3d_matinsulating                     )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°2---------------------------
+	 (k = 2                                                        )
+	 (jc_y_#k = -bar_centre_dist -l_quarter_bloc1 -bar_width_BE/2  )
+	 (jd_y_#k =  bar_width_BE                                      )
+	 (ny_#k   =  n_bar_width_BE                                    )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°3---------------------------
+	 (k = 3                                                        )
+	 (jc_y_#k = -bar_centre_dist -l_quarter_bloc1 -0.5*l_quarter_bloc2 -bar_width_BE )
+	 (jd_y_#k = l_quarter_bloc2                                     )
+	 (ny_#k   = n_bar_l1                                           )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°4---------------------------
+	 (k = 4                                                        )
+	 (jc_y_#k = -bar_centre_dist -l_quarter_bloc1/2                )
+	 (jd_y_#k = l_quarter_bloc1                                    )
+	 (ny_#k   = n_bar_l2                                           )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°5---------------------------
+	 (k = 5                                                        )
+	 (jc_y_#k = bar_centre_dist + l_quarter_bloc1 +bar_width_BE/2   )
+	 (jd_y_#k =  bar_width_BE                                      )
+	 (ny_#k   =  n_bar_width_BE                                    )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°6---------------------------
+	 (k = 6                                                        )
+	 (jc_y_#k = bar_centre_dist +l_quarter_bloc1 +0.5*l_quarter_bloc2 +bar_width_BE )
+	 (jd_y_#k = l_quarter_bloc2                                    )
+	 (ny_#k   = n_bar_l1                                           )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°7---------------------------
+	 (k = 7                                                        )
+	 (jc_y_#k = bar_centre_dist +l_quarter_bloc1/2                 )
+	 (jd_y_#k = l_quarter_bloc1                                    )
+	 (ny_#k   = n_bar_l2                                           )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°8---------------------------
+	 (k = 8                                                        )
+	 (jc_y_#k =  bloc_length-side_chan_width_y/2                   )
+	 (jd_y_#k =  side_chan_width_y                                 )
+	 (ny_#k   =  Nbain_Y_2                                         )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------SLICE n°9---------------------------
+	 (k = 9                                                        )
+	 (jc_y_#k =  -bloc_length+side_chan_width_y/2                   )
+	 (jd_y_#k =  side_chan_width_y                                 )
+	 (ny_#k   =  Nbain_Y_2                                         )
+	 (k_bar_#k            = ns3d_matbars                           )
+	 (k_cathode_#k        = ns3d_matcathode                        )
+	 (k_cast_iron_top_#k  = ns3d_matcastiron_top                   )
+	 (k_cast_iron_side_#k = ns3d_matcastiron_side                  )
+	 # -------------------------------------------------------------
+
+	 # Cathodic bar outer part
+	 # -----------------------
+
+	 # -------------------------Upstream---------------------------
+	 (jc_x = -dist_bar_to_bar/2)  
+	 (jc_y = -bar_centre_dist -l_quarter_bloc1 -bar_width_BE/2 )
+	 (jc_z = -bloc_height - bar_height - cast_iron_z -bar_length_BE/2)
+	 (jd_x = bar_width)
+	 (jd_y = bar_width_BE)
+	 (jd_z = bar_length_BE)
+	 Mjoint.mac(j_up_bar;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;n_bar_width;n_bar_width_BE;3;ns3d_matbars) 
+	 # ------------------------Downstream--------------------------
+	 (jc_x = -dist_bar_to_bar/2)  
+	 (jc_y = bar_length/2 + bloc_length/2 )
+	 (jc_z = -bloc_height - bar_height/2 - cast_iron_z)
+	 (jd_x = bar_width)
+	 (jd_y = bar_length - bloc_length)
+	 (jd_z = bar_height)
+	 Mjoint.mac(j_dw_bar;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;n_bar_width;3;n_bar_height;ns3d_matbars)
+	 # ------------------------------------------------------------
+  ENDIF
+
+# =================================================================
+#
+# Elementatry module for cathode meshing :
+# ---------------------------------------
+#
+#         => graphite + cast iron + cathodic bar
+#
+# =================================================================
+
+# Loop for all blocs
+# -------------------
+ FOR f=1 TO n_blocs DO("f")
+
+ FOR s=1 TO n_bar_per_bloc DO("s")
+
+ IF(eq(s,1))THEN
+	(sign = 1)
+ ELSE
+	(sign = -1)
+ ENDIF
+
+# Loop over the number of slices of the cathodic bloc
+# ---------------------------------------------------
+ FOR e=1 TO nb_slices DO("e")
+
+ (k = nb_slices*(f-1)+e)
+ (jc_y = %jc_y_#e)
+ (jd_y = %jd_y_#e)
+ (nyy  = %ny_#e  )
+ (nxx  = n_cathode_between_bar_end )  
+ IF(eq(f,1))THEN
+ IF(eq(s,1))THEN
+ (nxx  = n_cathode_between_bar_end + (Nbain_X_3-1)) 
+ ENDIF
+ ENDIF
+
+ IF(eq(f,n_blocs))THEN
+ IF(eq(s,2))THEN
+ (nxx  = n_cathode_between_bar_end + (Nbain_X_3-1)) 
+ ENDIF
+ ENDIF
+
+ # Cathodic bar
+ # ------------
+
+ (m = %k_bar_#e)
+ (jc_x = sign*(-dist_bar_to_bar/2))
+ (jc_z = -bloc_height - bar_height/2 - cast_iron_z)
+ (jd_x = bar_width)
+ (jd_z = bar_height)
+ Mjoint.mac( j_bar_#k_#s ; jc_x ; jc_y ; jc_z ; jd_x ; jd_y ; jd_z ; n_bar_width ; nyy ; n_bar_height ; m )
+
+ # Cathode : carbon or graphite part
+ # -------------------------------
+
+ (m = %k_cathode_#e)
+ (jc_x = sign*(-(dist_bar_to_bar/2-bar_width/2-cast_iron_x)/2))  
+ (jc_z = -bloc_height/2)
+ (jd_x = dist_bar_to_bar/2-bar_width/2-cast_iron_x)
+ (jd_z = bloc_height)
+ Mjoint.mac( jc0_z0_#k_#s;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;n_cathode_between_bar_centre;nyy;n_cathode_height;m)
+
+ (m = %k_cathode_#e)
+ (jc_x = sign*(-dist_bar_to_bar/2))  
+ (jc_z = -bloc_height/2)
+ (jd_x = bar_width+2*cast_iron_x)
+ (jd_z = bloc_height)
+ Mjoint.mac( jc1_z0_#k_#s;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;n_bar_width;nyy;n_cathode_height;m)
+
+ (m = %k_cathode_#e)
+ (jc_x = sign*(-(bloc_width/2 + (dist_bar_to_bar/2 + bar_width/2 + cast_iron_x))/2))  
+ (jc_z = -bloc_height/2)
+ (jd_x = bloc_width/2 - (dist_bar_to_bar/2 + bar_width/2 + cast_iron_x))
+ (jd_z = bloc_height)
+ Mjoint.mac( jc2_z0_#k_#s;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;nxx;nyy;n_cathode_height;m)
+
+ (m = %k_cathode_#e)
+ (jc_x = sign*(-(dist_bar_to_bar/2-bar_width/2-cast_iron_x)/2))  
+ (jc_z = -bloc_height - bar_height/2 - cast_iron_z/2)
+ (jd_x = dist_bar_to_bar/2-bar_width/2-cast_iron_x)
+ (jd_z = bar_height + cast_iron_z)
+ Mjoint.mac( jc0_z1_#k_#s;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;n_cathode_between_bar_centre;nyy;n_bar_height;m)
+
+ (jc_x = sign*(-(bloc_width/2 + (dist_bar_to_bar/2 + bar_width/2 + cast_iron_x))/2))  
+ (jc_z = -bloc_height - bar_height/2 - cast_iron_z/2)
+ (jd_x = bloc_width/2 - (dist_bar_to_bar/2 + bar_width/2 + cast_iron_x))
+ (jd_z = bar_height + cast_iron_z)
+ Mjoint.mac( jc2_z1_#k_#s;jc_x;jc_y;jc_z;jd_x;jd_y;jd_z;nxx;nyy;n_bar_height;m)
+
+ # Cast iron top
+ # -------------
+
+ (m = %k_cast_iron_top_#e)
+ (yc = %jc_y_#e)
+ (yd = %jd_y_#e)
+ (y = yc - yd/2)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2)))
+ (z = -bloc_height-cast_iron_z)
+ Mpoint.mac(pt1_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2 + cast_iron_x)))
+ (z = -bloc_height)
+ Mpoint.mac(pt5_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2)))
+ (z = -bloc_height-cast_iron_z)
+ Mpoint.mac(pt2_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2 - cast_iron_x)))
+ (z = -bloc_height)
+ Mpoint.mac(pt6_#k_#s; x ; y ; z)
+
+ (y = yc + yd/2)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2)))
+ (z = -bloc_height-cast_iron_z)
+ Mpoint.mac(pt3_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2 - cast_iron_x)))
+ (z = -bloc_height)
+ Mpoint.mac(pt7_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2)))
+ (z = -bloc_height-cast_iron_z)
+ Mpoint.mac(pt4_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2 + cast_iron_x)))
+ (z = -bloc_height)
+ Mpoint.mac(pt8_#k_#s; x ; y ; z)
+
+ Mhexa.mac(jt_#k_#s;n_bar_width;nyy;1;pt1_#k_#s;pt2_#k_#s;pt3_#k_#s;pt4_#k_#s;pt5_#k_#s;pt6_#k_#s;pt7_#k_#s;pt8_#k_#s;m)
+
+ # Cast iron side
+ # --------------
+ (m = %k_cast_iron_side_#e)
+ (y = yc - yd/2)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2 + cast_iron_x)))
+ (z = -bloc_height-cast_iron_z-bar_height)
+ Mpoint.mac(p11_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2 + cast_iron_x)))
+ (z = -bloc_height)
+ Mpoint.mac(p15_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2)))
+ (z = -bloc_height-cast_iron_z-bar_height)
+ Mpoint.mac(p12_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2)))
+ (z = -bloc_height-cast_iron_z)
+ Mpoint.mac(p16_#k_#s; x ; y ; z)  
+
+ (y = yc + yd/2)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2)))
+ (z = -bloc_height-cast_iron_z-bar_height)
+ Mpoint.mac(p13_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2)))
+ (z = -bloc_height-cast_iron_z)
+ Mpoint.mac(p17_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2+ cast_iron_x)))
+ (z = -bloc_height-cast_iron_z-bar_height)
+ Mpoint.mac(p14_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 + bar_width/2+ cast_iron_x)))
+ (z = -bloc_height)
+ Mpoint.mac(p18_#k_#s; x ; y ; z)
+
+ Mhexa.mac(js1_#k_#s;1;nyy;NLbars;p11_#k_#s;p12_#k_#s;p13_#k_#s;p14_#k_#s;p15_#k_#s;p16_#k_#s;p17_#k_#s;p18_#k_#s;m)
+
+ (y = yc - yd/2)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2)))
+ (z = -bloc_height-cast_iron_z-bar_height)
+ Mpoint.mac(p21_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2)))
+ (z = -bloc_height-cast_iron_z)
+ Mpoint.mac(p25_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2 -cast_iron_x)))
+ (z = -bloc_height-cast_iron_z-bar_height)
+ Mpoint.mac(p22_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2 -cast_iron_x)))
+ (z = -bloc_height)
+ Mpoint.mac(p26_#k_#s; x ; y ; z)
+
+ (y = yc + yd/2)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2 -cast_iron_x)))
+ (z = -bloc_height-cast_iron_z-bar_height)
+ Mpoint.mac(p23_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2 -cast_iron_x)))
+ (z = -bloc_height)
+ Mpoint.mac(p27_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2)))
+ (z = -bloc_height-cast_iron_z-bar_height)
+ Mpoint.mac(p24_#k_#s; x ; y ; z)
+
+ (x = sign*(-(dist_bar_to_bar/2 - bar_width/2)))
+ (z = -bloc_height-cast_iron_z)
+ Mpoint.mac(p28_#k_#s; x ; y ; z)
+
+ Mhexa.mac(js2_#k_#s;1;nyy;NLbars;p21_#k_#s;p22_#k_#s;p23_#k_#s;p24_#k_#s;p25_#k_#s;p26_#k_#s;p27_#k_#s;p28_#k_#s;m)
+
+  ENDDO("e")
+  ENDDO("s")
+
+ # ----------------------------------------
+ # Merging
+ # ----------------------------------------
+
+ (m = ns3d_matbars)
+ Mmerge_mesh.mac( mesh_#m_#f ; 8)
+ FOR s=1 TO n_bar_per_bloc DO("s")
+	FOR e=2 TO nb_slices DO("e")
+		 (k = nb_slices*(f-1)+e)
+		 Mmerge_mesh_subBARS.mac(j_bar_#k_#s ; ID) 
+	ENDDO("e")
+ ENDDO("s")
+	Mmerge_mesh_subBARS.mac(j_up_bar ; ID)
+	Mmerge_mesh_subBARS.mac(j_dw_bar ; ID)
+ IF(eq(n_bar_per_bloc,2))THEN
+	Mmerge_mesh_subBARS.mac(j_up_bar ; SYM_X)
+	Mmerge_mesh_subBARS.mac(j_dw_bar ; SYM_X)
+ ENDIF
+ end
+
+ (m = ns3d_matinsulating)
+ Mmerge_mesh.mac( mesh_#m_#f ; 8)
+ FOR s=1 TO n_bar_per_bloc DO("s")
+	Mmerge_mesh_subBARS.mac(j_bar_#1_#s ; ID) 
+ ENDDO("s")
+ end
+
+ (m = ns3d_matcathode)
+ Mmerge_mesh.mac( mesh_#m_#f ; 8)
+ FOR s=1 TO n_bar_per_bloc DO("s")
+ 	 FOR e=1 TO nb_slices DO("e")
+		 (k = nb_slices*(f-1)+e)
+		 Mmerge_mesh_subBARS.mac(jc0_z0_#k_#s ; ID)
+		 Mmerge_mesh_subBARS.mac(jc1_z0_#k_#s ; ID)
+		 Mmerge_mesh_subBARS.mac(jc2_z0_#k_#s ; ID)
+		 Mmerge_mesh_subBARS.mac(jc0_z1_#k_#s ; ID)
+		 Mmerge_mesh_subBARS.mac(jc2_z1_#k_#s ; ID)
+	ENDDO("e")
+ ENDDO("s")
+ end
+
+ (m = ns3d_matcastiron_side)
+ Mmerge_mesh.mac( mesh_#m_#f ; 8)
+ FOR s=1 TO n_bar_per_bloc DO("s")
+ 	 FOR e=1 TO nb_slices DO("e")
+		 (k = nb_slices*(f-1)+e)
+		 Mmerge_mesh_sub.mac(js1_#k_#s ; ID)
+		 Mmerge_mesh_sub.mac(js2_#k_#s ; ID)
+	ENDDO("e")
+ ENDDO("s")
+ end
+
+ (m = ns3d_matcastiron_top)
+ Mmerge_mesh.mac( mesh_#m_#f ; 8)
+ FOR s=1 TO n_bar_per_bloc DO("s")
+ 	FOR e=1 TO nb_slices DO("e")
+		(k = nb_slices*(f-1)+e)
+ 		Mmerge_mesh_sub.mac(jt_#k_#s ; ID)
+	ENDDO("e")
+ ENDDO("s")
+ end
+
+#----------------------------------------------------------------------
+# Symmetry, duplication ...
+#----------------------------------------------------------------------
+# Case with 1 bars per bloc
+
+	 Mmerge_mesh.mac( cath_block_un_#f ; 8)
+	    Mmerge_mesh_sub.mac(mesh_#refcath_#f ; ID)
+	    Mmerge_mesh_sub.mac(mesh_#refbars_#f ; ID)
+	    Mmerge_mesh_sub.mac(mesh_#reftop_#f  ; ID)
+	    Mmerge_mesh_sub.mac(mesh_#refside_#f ; ID)
+	    Mmerge_mesh_sub.mac(mesh_#refins_#f  ; ID)
+	 end
+
+IF(eq(n_bar_per_bloc,1))THEN
+
+  #... Translation to the end of the cell
+	IF(eq(f,1))THEN
+		Mtransl.mac( cath_block_un_#f ; -bloc_width*(n_blocs/2-1)/2 ; 0 ; 0 ; cathodic_b#1 ) # pour les blocs
+	ELSE
+		(d = bloc_width*(f-1)/2- bloc_width*(n_blocs/2-1)/2)
+		Mtransl.mac( cath_block_un_#f ; d ; 0 ; 0 ; cathodic_b#f )
+	ENDIF
+ENDIF
+
+# Case with 2 bars per bloc
+IF(eq(n_bar_per_bloc,2))THEN
+
+  #... Translation to the end of the cell
+	IF(eq(f,1))THEN
+		Mtransl.mac( cath_block_un_#f ; -bloc_width*(n_blocs/2-0.5) ; 0 ; 0 ; cathodic_b#1 ) # pour les blocs
+	ELSE
+		(d = bloc_width*(f-1)- bloc_width*(n_blocs/2-0.5))
+		Mtransl.mac( cath_block_un_#f ; d ; 0 ; 0 ; cathodic_b#f )
+	ENDIF
+ENDIF
+
+ENDDO("f")
+
+  Mmerge_mesh.mac( cathodic_block ; 8)
+     FOR k=1 TO n_blocs DO("k")
+        Mmerge_mesh_sub.mac(cathodic_b#k ; ID)
+     ENDDO("k")
+  end
+
+return
+
+#----------------------------------------------------------------------
+#              Steel Shell
+#----------------------------------------------------------------------
+ IF(with_ferro)THEN
+   _mesh_ferro.mac()
+ ENDIF
+
+#----------------------------------------------------------------------
+#               Final merging
+#----------------------------------------------------------------------
+#----------------------------------------------------------------------
+## |  |  Final merging and meshing
+
+mesh
+  #----------------------------------------------------------------------
+  # Merge pot
+   Mmerge_mesh.mac( cell_hexa ; 8)
+     Mmerge_mesh_sub.mac( meshanode ; ID )
+     Mmerge_mesh_sub.mac( meshbain  ; ID )
+     Mmerge_mesh_sub.mac( cathodic_block  ; ID )
+     IFENABLED(rm_anode_beam)THEN
+       # Nothing to do
+     ELSE
+       IF(CAO)THEN
+         Mmerge_mesh_sub.mac( CAO_mesh  ; ID )
+       ELSE
+         Mmerge_mesh_sub.mac( meshbeam  ; ID )
+       ENDIF
+     ENDIF
+   end
+
+return
+
+IFENABLED(DEBUG)THEN
+  (ensight_name="debug_cathode")
+  (ensight_format="formatted")
+  (cathodic_block_eltype="hexa8")
+  ensight
+    add cathodic_block_nodes
+  return
+ENDIF
+
+#----------------------------------------------------------------------
+#               Fluid meshing
+#----------------------------------------------------------------------
+# Compatibility with older versions
+ (geom_nzm1 = NLalu)
+ (geom_nzp1 = NLbain)
+ (mesh_no_penta=1)
+
+# Penta_Hexa
+  (geom_interface_nx = int(Nxcat/2 + Nxan/2) + 0)
+  (geom_interface_ny = Ny)
+# |  |  |  |  geom_interface : INT_geom_interface_nx _TNI and  INT_geom_interface_ny _TNI
+  mesh/mesh_cell_tetra_new_SR.mac()
+
+#----------------------------------------------------------------------
+#               Assembly
+#----------------------------------------------------------------------
+  mesh
+       (mesh_norenumel=1)
+       (merge_syme=0)
+       (renum_order=1)
+     Mmerge_mesh.mac( hexamesh ; 8)
+        Mmerge_mesh_sub.mac( cell_hexa ; ID )
+        Mmerge_mesh_sub.mac( cell_tetra  ; ID )
+     end
+      # Split Hexa into tetra
+      Mtetra.mac( hexamesh  ; cuveb ; hexa_tetra)
+  return
+
+# ---------------------------------------------------------------------
+    connex  cuveb
+
+# ------------------------------------------------------------------
+## |  |  |  Option-0 test: dump cuveb (pre-bowls) to ASCII
+# ------------------------------------------------------------------
+  (ds_wrbr="('x_y',i8,3e25.15)")
+  write  cuveb_nodes
+  write  cuveb_elems
+  write  cuveb_refs
+
+## |  |  |  |  Nb of connex component(s) without bars: INT_cuveb_nc _TNI
+
+# ---------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------
+
+  IFENABLED(DEBUG)THEN
+    (ensight_name="debug_mesh")
+    (ensight_format="formatted")
+    (cuveb_eltype="tetra4")
+    (ferro_eltype="tetra4")
+    ensight
+      add  cuveb_nodes
+      IF(with_ferro)THEN
+        add ferro_nodes
+      ENDIF
+    return
+  ENDIF
+
+  IF(with_bowls)THEN
+# ------------------------------------------------------------------
+## |  |  |  Generate the bowls around the cell
+# ------------------------------------------------------------------
+    mesh/bowls_mesh.mac()
+    mesh/ghs3d_mesh.mac()
+  ENDIF
+
+# ------------------------------------------------------------------
+## |  |  |  Visualization of final mesh
+# ------------------------------------------------------------------
+  (ensight_name="ensight_mesh")
+  (ensight_format="formatted")
+  (cuveb_eltype="tetra4")
+  (allmesh_eltype="tetra4")
+  (ferro_eltype="tetra4")
+  ensight
+    add cuveb_nodes
+    add allmesh_nodes
+    IF(with_ferro)THEN
+      add ferro_nodes
+    ENDIF
+  return
+
+endmacro

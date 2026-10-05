@@ -1,0 +1,46 @@
+# ==========================================================================
+#  POD-ResNet surrogate — full 3-D velocity
+#
+#  Built by:
+#    python prepare_alucell.py --master ../report_ML/master_ml.h5 \
+#        --manifest ../report_ML/manifest.csv \
+#        --mapping velocity_full --delta --pod --n-modes 64 \
+#        --include-dead --output data/full3d_pod_delta.h5
+#
+#  The target is the vector of 64 POD coefficients of the perturbation
+#  about the near-uniform reference run, so the network is a small map
+#  R^24 -> R^64.  The POD basis is fitted on the TRAIN split only.
+# ==========================================================================
+
+benchmark: "alucell"
+seed: 42
+
+data:
+  h5_path: "./data/full3d_pod_delta_k24.h5"
+
+  n_params: 24            # 24 anodes
+  spatial_dim: 3
+  # M_out (= n_modes) is read from the HDF5 automatically
+
+  use_subset: no
+  normalize: false        # POD coefficients are already scaled by the SVD
+
+training:
+  epochs: 500
+  batch_size: 32
+  lr: 0.001
+  weight_decay: 1.0e-4
+  patience: 50
+  num_workers: 4
+
+  # rel_l2 is logged but not monitored: the target is a perturbation, so
+  # ||target|| -> 0 for runs near the reference and the relative error blows
+  # up exactly where the model is most accurate.
+  val_metric: rmse
+
+  grad_loss_weight: 0.0   # POD coefficients carry no spatial gradient
+
+model:
+  type: "ResFFNN"         # POD done offline -> plain residual MLP on coeffs
+  hidden_dim: 256
+  num_blocks: 4

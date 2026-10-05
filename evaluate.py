@@ -9,8 +9,8 @@ For Alucell with delta-learning or POD coefficients, this script:
 
 Usage
 -----
-    python evaluate.py --config config_alucell.yaml
-    python evaluate.py --config config_alucell.yaml --model models/best_model_POD_MLP.pth
+    python evaluate.py --config configs/config_alucell.yaml
+    python evaluate.py --config configs/config_alucell.yaml --model models/best_model_POD_MLP.pth
 """
 
 import argparse
@@ -60,8 +60,20 @@ def run_inference(model, loader, x_grid, device):
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> dict:
-    # 1. Root Mean Square Error (Absolute physical magnitude)
+def compute_metrics(preds: np.ndarray, targets: np.ndarray,
+                    n_comp: int = 1) -> dict:
+    """Per-sample metrics.
+
+    n_comp is the number of components carried at each node (3 for a velocity,
+    1 for the interface).  It only affects R^2, through the baseline that SST
+    measures against: for a vector field the sensible baseline is the mean of
+    each component over the nodes, a vector in R^{n_comp}.  Flattening first and
+    taking one scalar mean over all n_comp*M entries averages u_x, u_y and u_z
+    together, which is not a field the model could have predicted and which
+    inflates SST -- and so R^2 -- by whatever the spread between components is.
+    """
+    # 1. Root Mean Square Error (Absolute physical magnitude).
+    #    Averaged over all n_comp*M entries, i.e. per component.
     rmse = np.sqrt(np.mean((preds - targets) ** 2, axis=1))
     
     # 2. Relative L2 Norm
@@ -72,7 +84,14 @@ def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> dict:
     
     # 3. Explained Variance (R^2 Score)
     ss_res = np.sum((targets - preds) ** 2, axis=1)
-    ss_tot = np.sum((targets - np.mean(targets, axis=1, keepdims=True)) ** 2, axis=1)
+    if n_comp > 1 and targets.shape[1] % n_comp == 0:
+        # [N, M*n_comp] -> [N, M, n_comp]; the fields are stored node-major
+        t = targets.reshape(targets.shape[0], -1, n_comp)
+        mu = t.mean(axis=1, keepdims=True)              # spatial mean per component
+        ss_tot = ((t - mu) ** 2).sum(axis=(1, 2))
+    else:
+        ss_tot = np.sum((targets - np.mean(targets, axis=1, keepdims=True)) ** 2,
+                        axis=1)
     r2 = 1.0 - (ss_res / (ss_tot + 1e-12))
 
     return {
@@ -379,7 +398,10 @@ def evaluate(config_path: str, model_path: str | None = None, n_plots: int = 5):
         if needs_recon:
             recon_preds   = reconstruct_field(preds, ctx)
             recon_targets = reconstruct_field(targets, ctx)
-            metrics_phys  = compute_metrics(recon_preds, recon_targets)
+            fs = ctx.get("field_shape") or ()
+            n_comp = int(fs[1]) if len(fs) > 1 else 1
+            metrics_phys  = compute_metrics(recon_preds, recon_targets,
+                                            n_comp=n_comp)
             print_metrics(metrics_phys, len(recon_preds),
                           label="reconstructed physical field")
 

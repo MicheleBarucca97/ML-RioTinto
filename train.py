@@ -3,9 +3,9 @@ Training script — works with any benchmark (1-D, 3-D, or Alucell).
 
 Usage
 -----
-    python train.py --config config_1d.yaml
-    python train.py --config config_3d.yaml
-    python train.py --config config_alucell.yaml
+    python train.py --config configs/config_1d.yaml
+    python train.py --config configs/config_3d.yaml
+    python train.py --config configs/config_alucell.yaml
 """
 
 import argparse
