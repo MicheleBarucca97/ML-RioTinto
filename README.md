@@ -62,10 +62,3 @@ Two error measures answer different questions and are not interchangeable:
 the physical fluctuation was captured; `rel_l2` lives on the reconstructed field
 with the reference added back, and is what an engineer reads.
 
-## Where the rest is
-
-- `CLAUDE.md` — working rules for this project, including the convergence traps.
-- `CONVENTIONS.md` — writing conventions for the note.
-- `.claude/solver.md` — the Alucell pipeline, its paths and its traps.
-- `.claude/measurements.md` — every number established, and the withdrawn ones.
-- `docs/RUNS.md` — where the simulation run directories live.
